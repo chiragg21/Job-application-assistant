@@ -4,4 +4,25 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "chromadb>=1.5.2",
+    "fastapi>=0.129.2",
+    "google-genai>=1.64.0",
+    "ipykernel>=7.2.0",
+    "ipywidgets>=8.1.8",
+    "jsonpatch>=1.33",
+    "langchain-core>=1.2.16",
+    "langgraph>=1.0.9",
+    "ollama>=0.6.1",
+    "openai>=2.24.0",
+    "pandas>=3.0.1",
+    "pathlib>=1.0.1",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+    "sentence-transformers>=5.2.3",
+    "sqlalchemy>=2.0.46",
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
+    "uvicorn>=0.41.0",
+]

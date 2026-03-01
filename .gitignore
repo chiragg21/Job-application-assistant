@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+data
+logs
+.env
+output
+testing_scripts
