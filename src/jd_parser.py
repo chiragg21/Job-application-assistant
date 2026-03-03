@@ -214,17 +214,20 @@ class JDParser:
         log.info("Saving JD to SQLite", extra={"user_id": user_id})
 
         job_id = self.db.add_one("jobs", {
-            "user_id":         user_id,
-            "company":         parsed.company,
-            "role":            parsed.role,
-            "jd_raw":          parsed.raw_text,
-            "jd_parsed":       json.dumps(parsed.to_dict()),
-            "seniority_level": parsed.seniority_level,
-            "location":        parsed.location,
-            "is_remote":       int(parsed.is_remote),
-            "raw_hash":        _hash_text(parsed.raw_text),
-            "parsed_hash":     _hash_dict(parsed.to_dict()),
-            "created_at":      datetime.now(timezone.utc),
+            "user_id":              user_id,
+            "company":              parsed.company,
+            "role":                 parsed.role,
+            "seniority_level":      parsed.seniority_level,
+            "location":             parsed.location,
+            "is_remote":            int(parsed.is_remote),
+            "responsibilities":     json.dumps(parsed.responsibilities),
+            "required_skills":      json.dumps(parsed.required_skills),
+            "nice_to_have_skills":  json.dumps(parsed.nice_to_have_skills),
+            "jd_raw":               parsed.raw_text,
+            "jd_parsed":            json.dumps(parsed.to_dict()),
+            "raw_hash":             _hash_text(parsed.raw_text),
+            "parsed_hash":          _hash_dict(parsed.to_dict()),
+            "created_at":           datetime.now(timezone.utc),
         })
 
         self._save_skills(job_id, parsed.required_skills,     is_required=1)
