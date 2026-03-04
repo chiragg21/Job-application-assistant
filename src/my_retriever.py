@@ -18,8 +18,8 @@ chroma_path = config['chromadb']['path']
 jd_col = config['chromadb']['collection1']
 resume_col = config['chromadb']['collection2']
 
-FLAT_SECTIONS = ['education', 'achievements', 'technical_skills', 'relevant_coursework']
-ATOMIC_SECTIONS = ['experience', 'projects']
+FLAT_SECTIONS =  config['resume_defaults']['flat_sections']
+ATOMIC_SECTIONS = config['resume_defaults']['atomic_sections']
 TOP_K = 10
 FETCH_MULTIPLIER = 3
 WEIGHT_REQUIRED_SKILLS = 1.0   # text[0]      hard requirements

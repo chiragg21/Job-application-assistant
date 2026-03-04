@@ -10,9 +10,7 @@ from torch.cuda import temperature
 from config.config import get_config_dict
 
 gemini_cnf = get_config_dict()['gemini_api']
-gemini_cnf['temperature'] = float(gemini_cnf.get("temperature", 0.2))
 openai_cnf = get_config_dict()["openai_api"]
-openai_cnf["temperature"] = float(openai_cnf.get("temperature", 0.2))
 
 T = TypeVar("T", bound=BaseModel)
 

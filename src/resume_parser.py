@@ -10,6 +10,9 @@ from utils.app_logger import get_logger
 import chromadb
 from chromadb.utils import embedding_functions
 
+from config.config import get_config_dict
+resume_cnf = get_config_dict()['resume_defaults']
+
 log = get_logger(__name__)
 
 SECTION_MAPPING = {
@@ -22,17 +25,16 @@ SECTION_MAPPING = {
 }
 
 # Sections that are split into per-company/per-project AtomicItems
-ATOMIC_SECTIONS = {"experience", "projects"}
+ATOMIC_SECTIONS = resume_cnf['atomic_sections']
 
 # Sections stored as a single content blob
-FLAT_SECTIONS = {"education", "skills", "achievements", "relevant_coursework"}
+FLAT_SECTIONS = resume_cnf['flat_sections']
 
 
 class ResumeParser:
     def __init__(self):
         self.db = SQLHandler()
 
-        from config.config import get_config_dict
         cfg = get_config_dict()
         vector_path = Path(cfg["path_dir"]["data_dir"]) / "vectorstore"
         embedding_model = cfg["rag_config"]["embedding_model"]
@@ -131,7 +133,6 @@ class ResumeParser:
         text = text.replace('~', ' ')
         text = text.replace('&', '&')
         text = re.sub(r'\\(?=[^a-zA-Z])', '', text)  # lone backslash before non-letter
-
         # 9. Collapse whitespace
         return ' '.join(text.split())
 
@@ -186,7 +187,7 @@ class ResumeParser:
         for block in raw_blocks:
             if not block:
                 continue
-
+            
             # --- Name: \textbf at the very start of the block ---
             name_match = re.match(r'\s*\\textbf\{(.*?)\}', block)
             name = name_match.group(1).strip() if name_match else None
@@ -208,6 +209,14 @@ class ResumeParser:
                 if not re.search(r'\d|–|-', candidate):
                     role = candidate.strip()
                     break
+            
+            # Fallback: role as plain text on the line after the \textbf{...} \hfill ... \\
+            if role is None:
+                plain_role_match = re.search(r'\\\\[\r\n]+([^\\\n\r{]+?)(?:\s*[\r\n]|\s*\\begin)', block)
+                if plain_role_match:
+                    candidate = plain_role_match.group(1).strip()
+                    if candidate and not re.search(r'\d|–|-', candidate):
+                        role = candidate
 
             items.append(AtomicItem(
                 name=name,
@@ -239,6 +248,7 @@ class ResumeParser:
                 continue
 
             content = content.strip()
+            content = re.sub(r'\\vspace\{[^}]*\}\n?', '', content).strip()
             if norm_name in ATOMIC_SECTIONS:
                 setattr(result, norm_name, self._parse_atomic_items(content))
             elif norm_name in FLAT_SECTIONS:
