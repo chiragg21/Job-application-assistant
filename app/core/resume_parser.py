@@ -1,17 +1,22 @@
+import os
 import re
 from typing import List, Tuple, Optional
 from pathlib import Path
-from utils.sqlite_handler import SQLHandler
-from data_models.resume_parse_dm import (
+from app.utils import SQLHandler, get_logger
+from app.models.resume import (
     PersonalInfo, ResumeSection, ParsedResume,
     SectionContent, AtomicItem
 )
-from utils.app_logger import get_logger
 import chromadb
 from chromadb.utils import embedding_functions
 
 from config.config import get_config_dict
-resume_cnf = get_config_dict()['resume_defaults']
+_cfg       = get_config_dict()
+resume_cnf = _cfg['resume_defaults']
+_HF_TOKEN  = _cfg.get("huggingface", {}).get("token") or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_TOKEN", "")
+if _HF_TOKEN:
+    os.environ.setdefault("HF_TOKEN", _HF_TOKEN)
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _HF_TOKEN)
 
 log = get_logger(__name__)
 
@@ -40,13 +45,14 @@ class ResumeParser:
         embedding_model = cfg["rag_config"]["embedding_model"]
 
         self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model
+            model_name=embedding_model,
+            token=_HF_TOKEN or None,
         )
         self.chroma_client = chromadb.PersistentClient(path=str(vector_path))
 
         self.col_resume = self.chroma_client.get_or_create_collection(
             name="resume_sections",
-            embedding_function=self.ef
+            embedding_function=self.ef,
         )
 
     # ------------------------------------------------------------------
@@ -370,6 +376,52 @@ class ResumeParser:
             self.col_resume.upsert(documents=documents, metadatas=metadatas, ids=ids)
             log.info(f"Successfully embedded {len(documents)} chunks for resume_id={resume_id}")
 
+    def add_to_sql_and_chroma(self, user_id: int, resume_path: Path, personal: PersonalInfo, resume_sections: ResumeSection):
+        # 1. Insert master record into resumes
+        resume_id = self.db.add_one("resumes", {
+            "user_id": user_id,
+            "resume_path": str(resume_path),
+            "name": personal.name,
+            "email": personal.email,
+            "phone": personal.phone,
+            "github_url": personal.github,
+            "linkedin_url": personal.linkedin,
+        })
+
+        # 2. Persist all sections into resume_sections (one row each).
+        #    Atomic sections additionally fan out into resume_section_items.
+        atomic_rows = {}
+
+        # Flat sections — just the parent row, no child items
+        for sec_name in FLAT_SECTIONS:
+            sc: Optional[SectionContent] = getattr(resume_sections, sec_name, None)
+            self._persist_section(
+                resume_id, sec_name,
+                content_latex=sc.content_latex if sc else None,
+                content_text=sc.content_text if sc else None,
+            )
+
+        # Atomic sections — parent row (full blob) + child item rows
+        for sec_name in ATOMIC_SECTIONS:
+            items: List[AtomicItem] = getattr(resume_sections, sec_name, [])
+
+            # Reconstruct full section blob from individual items
+            full_latex = "\n\n".join(i.content_latex for i in items) or None
+            full_text = " ".join(i.content_text for i in items) or None
+
+            section_id = self._persist_section(
+                resume_id, sec_name,
+                content_latex=full_latex,
+                content_text=full_text,
+            )
+
+            atomic_rows[sec_name] = self._persist_section_items(
+                resume_id, section_id, sec_name, items
+            )
+
+        # 3. Embed everything into ChromaDB
+        self.chunk_and_embed(resume_id, personal, resume_sections, atomic_rows)
+        return resume_id
     # ------------------------------------------------------------------
     # Orchestrator
     # ------------------------------------------------------------------
@@ -383,58 +435,13 @@ class ResumeParser:
             personal = self.extract_personal_info(self._strip_comments(latex_code))
             resume_sections = self.parse_sections(latex_code)  # strips internally
 
-            resume_id = "N/A"
 
             if user_id is not None:
                 log.info(f"Storing resume for user_id={user_id}, name={personal.name}")
-
-                # 1. Insert master record into resumes
-                resume_id = self.db.add_one("resumes", {
-                    "user_id": user_id,
-                    "resume_path": str(resume_path),
-                    "name": personal.name,
-                    "email": personal.email,
-                    "phone": personal.phone,
-                    "github_url": personal.github,
-                    "linkedin_url": personal.linkedin,
-                })
-
-                # 2. Persist all sections into resume_sections (one row each).
-                #    Atomic sections additionally fan out into resume_section_items.
-                atomic_rows = {}
-
-                # Flat sections — just the parent row, no child items
-                for sec_name in FLAT_SECTIONS:
-                    sc: SectionContent = getattr(resume_sections, sec_name, None)
-                    self._persist_section(
-                        resume_id, sec_name,
-                        content_latex=sc.content_latex if sc else None,
-                        content_text=sc.content_text if sc else None,
-                    )
-
-                # Atomic sections — parent row (full blob) + child item rows
-                for sec_name in ATOMIC_SECTIONS:
-                    items: List[AtomicItem] = getattr(resume_sections, sec_name, [])
-
-                    # Reconstruct full section blob from individual items
-                    full_latex = "\n\n".join(i.content_latex for i in items) or None
-                    full_text = " ".join(i.content_text for i in items) or None
-
-                    section_id = self._persist_section(
-                        resume_id, sec_name,
-                        content_latex=full_latex,
-                        content_text=full_text,
-                    )
-
-                    atomic_rows[sec_name] = self._persist_section_items(
-                        resume_id, section_id, sec_name, items
-                    )
-
-                # 3. Embed everything into ChromaDB
-                self.chunk_and_embed(resume_id, personal, resume_sections, atomic_rows)
-
+                resume_id = self.add_to_sql_and_chroma(user_id, resume_path, personal, resume_sections)
+                
             return ParsedResume(
-                resume_id=str(resume_id),
+                resume_id=str(resume_id) if resume_id else "N/A",
                 resume_path=str(resume_path),
                 personal_info=personal,
                 resume_sections=resume_sections,

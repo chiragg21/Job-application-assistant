@@ -1,0 +1,5 @@
+DELETE FROM jobs;
+
+ALTER TABLE jobs ADD COLUMN about_company TEXT;
+ALTER TABLE jobs ADD COLUMN about_job TEXT;
+ALTER TABLE jobs ADD COLUMN perks TEXT;

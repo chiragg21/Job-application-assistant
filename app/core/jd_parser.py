@@ -1,9 +1,12 @@
 """
 pipelines/jd_parser.py
 ----------------------
-Parses a raw job description (plain text) using Qwen-2.5-72B via
-LLM handler uses gemini or openai based on input, stores structured output
-in SQLite via SQLHandler, and chunks + embeds into ChromaDB.
+Parses a raw job description (plain text) using an LLM (Gemini by default),
+stores structured output in SQLite via SQLHandler, and chunks + embeds into
+ChromaDB.
+
+New fields in ParsedJD (v2):
+    about_company, about_job, perks, others
 
 Duplicate handling:
     1. Hash raw JD text → if match found in SQLite, skip everything
@@ -23,28 +26,22 @@ Usage:
     result = parser.run(jd_text="...", user_id=1)
 """
 
-import sys
-import pathlib
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-
 import hashlib
 import json
+import os
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
-from openai import OpenAI
-from pydantic import ValidationError
 
-from data_models.jd_parse_dm import ParsedJD
+from app.models.jd import ParsedJD
 from config.config import get_config_dict
-from utils.app_logger import get_logger, log_llm_call, log_exception
-from utils.sqlite_handler import SQLHandler
-from utils.llm_handler import LLMHandler
+from app.utils.logger import get_logger
+from app.utils import SQLHandler
+from app.utils.llm import llm as _llm, Prompt
 
 log = get_logger(__name__)
 
@@ -55,15 +52,18 @@ log = get_logger(__name__)
 cfg      = get_config_dict()
 path_cfg = cfg["path_dir"]
 rag_cfg  = cfg["rag_config"]
-llm_cfg  = cfg["openai_api"]
 
 VECTORSTORE_PATH = Path(path_cfg["data_dir"]) / "vectorstore"
 EMBEDDING_MODEL  = rag_cfg["embedding_model"]
+HF_TOKEN         = cfg.get("huggingface", {}).get("token") or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_TOKEN", "")
+
+# Expose token to sentence-transformers / huggingface_hub automatically
+if HF_TOKEN:
+    os.environ.setdefault("HF_TOKEN", HF_TOKEN)
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", HF_TOKEN)
 
 COL_JD_CHUNKS      = "jd_chunks"
 COL_CACHED_OUTPUTS = "cached_jd_outputs"
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -87,25 +87,25 @@ class JDParser:
 
     Methods:
         check_duplicate()   — hash-based duplicate check via SQLHandler
-        parse_with_llm()    — LLM helper call to parse raw JD text into structured ParsedJD
+        parse_with_llm()    — LLM call to parse raw JD text into ParsedJD
         save_to_sqlite()    — save job + skills via SQLHandler
         chunk_and_embed()   — chunk and upsert into ChromaDB
         run()               — orchestrate full pipeline
     """
 
     def __init__(self):
-        self.db = SQLHandler()
-
-        self.llm_helper = LLMHandler(llm_type="gemini")
+        self.db         = SQLHandler()
+        self.llm_helper = _llm
 
         self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL
+            model_name=EMBEDDING_MODEL,
+            token=HF_TOKEN or None,
         )
         chroma = chromadb.PersistentClient(path=str(VECTORSTORE_PATH))
-        self._col_jd_chunks = chroma.get_collection(COL_JD_CHUNKS)
-        self._col_cached    = chroma.get_collection(COL_CACHED_OUTPUTS)
+        self._col_jd_chunks = chroma.get_collection(COL_JD_CHUNKS, embedding_function=self.ef)
+        self._col_cached    = chroma.get_collection(COL_CACHED_OUTPUTS, embedding_function=self.ef)
 
-        log.info("JDParser ready", extra={"model": self.llm_helper.handler.model})
+        log.info("JDParser ready")
 
     # ------------------------------------------------------------------
     # 1. Duplicate detection
@@ -146,10 +146,12 @@ class JDParser:
     def parse_with_llm(self, jd_text: str) -> ParsedJD:
         """
         Parse raw JD text using LLM handler.
+        Returns a validated ParsedJD instance.
         """
-        log.info("Sending JD to LLM handler using model", extra={"model": self.llm_helper.handler.model})
+        import re as _re
 
-        # Build schema string to include in prompt so model knows exact output format
+        log.info("Sending JD to LLM")
+
         schema = ParsedJD.model_json_schema()
 
         system_prompt = (
@@ -160,27 +162,38 @@ class JDParser:
         )
 
         try:
-            response = self.llm_helper.generate(
-                f"Parse this job description:\n\n{jd_text}",
-                system_prompt,
-                ParsedJD,
-                1200
+            result = self.llm_helper.generate(
+                Prompt(system=system_prompt, user=f"Parse this job description:\n\n{jd_text}"),
+                provider="gemini",
+                response_model=ParsedJD,
             )
-            
-            parsed = response.get('content', {})
 
-            # Set raw_text manually — excluded from schema so LLM doesn't try to fill it
+            if result.error:
+                raise ValueError(f"LLM request failed: {result.error}")
+
+            parsed: ParsedJD | None = result.parsed
+
+            # Fallback: if the client couldn't auto-parse, strip fences and retry manually
+            if parsed is None:
+                raw = result.content or ""
+                log.warning("schema_matched=False — attempting manual JSON extraction")
+                log.debug("Raw LLM response: %s", raw[:500])
+
+                # Strip ```json ... ``` or ``` ... ``` fences
+                stripped = _re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+                # Find the outermost JSON object
+                start = stripped.find("{")
+                end   = stripped.rfind("}") + 1
+                if start == -1 or end == 0:
+                    raise ValueError(
+                        f"LLM response contained no JSON object. Raw response: {raw[:300]}"
+                    )
+                json_str = stripped[start:end]
+                parsed = ParsedJD.model_validate_json(json_str)
+
+            # raw_text is excluded from schema so LLM won't fill it — set manually
             parsed.raw_text = jd_text
-
-            # Correct token attribute names for openai SDK v1.x
-            usage = response.get("usage", {})
-            log_llm_call(
-                pipeline="jd_parser",
-                model=self.llm_helper.handler.model,
-                input_tokens=usage['input_tokens'] if usage else 0,        # NOT input_tokens
-                output_tokens=usage['output_tokens'] if usage else 0, # NOT output_tokens
-                output_type="jd_parse",
-            )
 
             log.info(
                 "JD parsed successfully",
@@ -191,15 +204,16 @@ class JDParser:
                     "required_skills":  len(parsed.required_skills),
                     "nice_to_have":     len(parsed.nice_to_have_skills),
                     "responsibilities": len(parsed.responsibilities),
+                    "has_about_company": bool(parsed.about_company),
+                    "has_about_job":     bool(parsed.about_job),
+                    "has_perks":         bool(parsed.perks),
+                    "has_others":        bool(parsed.others),
                 },
             )
             return parsed
 
-        # except json.JSONDecodeError as e:
-        #     log_exception(log, "LLM returned invalid JSON", raw=raw_json)
-        #     raise ValueError(f"LLM returned invalid JSON: {e}") from e
         except Exception:
-            log_exception(log, "LLM call failed")
+            log.exception("LLM call failed")
             raise
 
     # ------------------------------------------------------------------
@@ -210,6 +224,9 @@ class JDParser:
         """
         Insert parsed JD into jobs, skills, job_skills via SQLHandler.
         Returns new job_id.
+
+        New columns written: about_company, about_job, perks, others
+        (add these columns to your jobs DDL if not present).
         """
         log.info("Saving JD to SQLite", extra={"user_id": user_id})
 
@@ -220,6 +237,12 @@ class JDParser:
             "seniority_level":      parsed.seniority_level,
             "location":             parsed.location,
             "is_remote":            int(parsed.is_remote),
+            # ---------- new fields ----------
+            "about_company":        parsed.about_company,
+            "about_job":            parsed.about_job,
+            "perks":                parsed.perks,
+            # "others":               parsed.others,
+            # --------------------------------
             "responsibilities":     json.dumps(parsed.responsibilities),
             "required_skills":      json.dumps(parsed.required_skills),
             "nice_to_have_skills":  json.dumps(parsed.nice_to_have_skills),
@@ -248,10 +271,8 @@ class JDParser:
             if not skill:
                 continue
 
-            # Insert skill if new, skip if already exists
             self.db.insert_or_ignore("skills", {"name": skill})
 
-            # Fetch its id
             row = self.db.fetch_one("skills", filters={"name": skill}, columns=["id"])
             if not row:
                 continue
@@ -273,6 +294,16 @@ class JDParser:
         """
         Split ParsedJD into typed chunks → upsert into jd_chunks.
         Upsert full JD into cached_jd_outputs for downstream output reuse.
+
+        Chunk strategy:
+            company_info      — company + role header (unchanged)
+            about_company     — free-text company blurb            [NEW]
+            about_job         — free-text role overview            [NEW]
+            responsibilities  — one chunk per item (granular retrieval)
+            required_skills   — comma-joined single chunk
+            nice_to_have_skills — comma-joined single chunk
+            perks             — benefits / compensation blurb      [NEW]
+            others            — catch-all remaining info           [NEW]
         """
         log.info("Chunking and embedding JD", extra={"job_id": job_id})
 
@@ -295,12 +326,17 @@ class JDParser:
             metadatas.append({**base_meta, "chunk_type": chunk_type, **extra})
             ids.append(doc_id)
 
+        # Structured header chunk
         _add(
             "company_info",
             f"Company: {parsed.company}\nRole: {parsed.role}\n"
             f"Seniority: {parsed.seniority_level}\n"
             f"Location: {parsed.location} (Remote: {parsed.is_remote})",
         )
+
+        # Free-text blurbs (new fields)
+        _add("about_company", parsed.about_company)
+        _add("about_job",     parsed.about_job)
 
         # One chunk per responsibility for granular retrieval
         for i, resp in enumerate(parsed.responsibilities):
@@ -312,11 +348,15 @@ class JDParser:
         if parsed.nice_to_have_skills:
             _add("nice_to_have_skills", ", ".join(parsed.nice_to_have_skills))
 
+        # Perks and catch-all (new fields)
+        _add("perks",  parsed.perks)
+        # _add("others", parsed.others)
+
         if documents:
             self._col_jd_chunks.upsert(documents=documents, metadatas=metadatas, ids=ids)
             log.info("JD chunks upserted", extra={"job_id": job_id, "chunks": len(documents)})
 
-        # Full JD → cached_jd_outputs (cover letter / email pipelines query this)
+        # Full JD → cached_jd_outputs (downstream pipelines query this)
         self._col_cached.upsert(
             documents=[parsed.raw_text],
             metadatas=[{
@@ -405,9 +445,15 @@ class JDParser:
 
 if __name__ == "__main__":
     sample_jd = """
+    About DeepMind Labs
+    DeepMind Labs is a frontier AI research company building general-purpose
+    agents. We are a 60-person team headquartered in Bangalore with offices
+    in London and San Francisco.
+
     About the Role
-    We are looking for a Junior Machine Learning Engineer at DeepMind Labs, Bangalore.
-    This is a remote-friendly role.
+    We are hiring a Junior Machine Learning Engineer to join our 8-person
+    Platform team. You will own the training infrastructure that powers our
+    core model research.
 
     Responsibilities:
     - Build and maintain ML pipelines for production models
@@ -421,6 +467,15 @@ if __name__ == "__main__":
     Nice to Have:
     - LangChain or LlamaIndex
     - MLflow, AWS or GCP
+
+    Perks:
+    - Competitive salary + equity
+    - Full health, dental, and vision coverage
+    - $2 000/yr learning budget
+
+    Other:
+    - We sponsor H-1B visas
+    - Interview process: screen → take-home → two technical rounds → offer
     """
 
     parser = JDParser()

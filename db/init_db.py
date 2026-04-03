@@ -26,7 +26,7 @@ from pathlib import Path
 
 import chromadb
 from chromadb.utils import embedding_functions
-from utils.app_logger import get_logger
+from utils.logger import get_logger
 from config.config import get_config_dict
 
 path_config = get_config_dict()['path_dir']

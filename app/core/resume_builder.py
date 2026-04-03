@@ -1,7 +1,7 @@
 import re
 import os
-from utils.sqlite_handler import SQLHandler
-from data_models.resume_builder_dm import ResumeBuilderInput
+from app.utils.sqlite_handler import SQLHandler
+from app.models.resume_builder import ResumeBuilderInput
 from config.config import get_config_dict
 
 resume_defaults = get_config_dict()['resume_defaults']
@@ -12,6 +12,15 @@ DEFAULT_RESUME_SECTION_VSPACE = resume_defaults['section_space']
 DEFAULT_RESUME_SUBSECTION_VSPACE = resume_defaults['subsection_space']
 FLAT_SECTIONS = resume_defaults['flat_sections']
 ATOMIC_SECTIONS = resume_defaults['atomic_sections']
+
+SECTION_HEADINGS: dict[str, str] = {
+    "education":           "Education",
+    "achievements":        "Achievements",
+    "skills":              "Technical Skills",
+    "relevant_coursework": "Relevant Coursework",
+    "experience":          "Experience",
+    "projects":            "Projects",
+}
 
 DEFAULT_PERSONAL_INFO = {
     "name": "Chirag Garg",
@@ -24,7 +33,12 @@ DEFAULT_PERSONAL_INFO = {
 }
 
 class ResumeBuilder:
-    def __init__(self, user_id: int|None, sections: ResumeBuilderInput) -> None:
+    def __init__(
+        self,
+        user_id: int | None,
+        sections: ResumeBuilderInput,
+        font_size: int | None = None,
+    ) -> None:
         self.db = SQLHandler()
         self.personal_info = {}
 
@@ -34,14 +48,14 @@ class ResumeBuilder:
         for key in DEFAULT_PERSONAL_INFO.keys():
             self.personal_info[key] = personal_info.get(key, DEFAULT_PERSONAL_INFO.get(key, None))
 
-        self.sections = sections
-
+        self.sections    = sections
+        self.font_size   = font_size if font_size is not None else DEFAULT_RESUME_FONT_SIZE
         self.current_resume = ""
         
 
     def _create_header(self):
         header = f"""
-\\documentclass[{DEFAULT_RESUME_FONT_SIZE}pt,a4paper]{{article}}
+\\documentclass[{self.font_size}pt,a4paper]{{article}}
 \\usepackage[a4paper,margin=0.65in]{{geometry}}
 \\usepackage{{titlesec}}
 \\usepackage{{enumitem}}
@@ -81,16 +95,23 @@ class ResumeBuilder:
         resume = self._create_header()
 
         for sec in section_order:
+            heading = SECTION_HEADINGS.get(sec, sec.replace("_", " ").title())
+            heading_latex = f"\\section{{{heading}}}\n"
             if sec in FLAT_SECTIONS:
-                resume+=self._add_space(section_space)+getattr(self.sections, sec).replace("\\end{document}", "")
+                content = (getattr(self.sections, sec, "") or "").replace("\\end{document}", "")
+                if content.strip():
+                    resume += self._add_space(section_space) + heading_latex + content + "\n"
             else:
-                resume+=self._add_space(section_space)
-                for i, subsec in enumerate(getattr(self.sections, sec)):
-                    if i>0:
-                        resume+=self._add_space(subsection_space)
-                    resume+=subsec.replace("\\end{document}", "")
-        
-        resume += "\n \\end{document}"
+                items = getattr(self.sections, sec, []) or []
+                non_empty = [s.replace("\\end{document}", "") for s in items if s and s.strip()]
+                if non_empty:
+                    resume += self._add_space(section_space) + heading_latex
+                    for i, subsec in enumerate(non_empty):
+                        if i > 0:
+                            resume += self._add_space(subsection_space)
+                        resume += subsec + "\n"
+
+        resume += "\n\\end{document}"
 
         self.current_resume = resume
         return resume

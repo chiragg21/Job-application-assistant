@@ -1,411 +1,243 @@
-# Resume Tailoring System — Refined Workflow
+# Job Assistant
 
-> Every table reference below maps directly to the final schema.
-> The unified `resume_section_items` table (child of `resume_sections`) replaces
-> the older `resume_experience_items` and `resume_project_items` tables.
+An AI-powered resume tailoring and job application assistant. Upload your resume, paste a job description, and the system retrieves the most relevant sections from your resume history, lets you review AI-suggested edits section by section, scores the result, and generates a cover letter, HR email, and outreach message.
 
 ---
 
-## Table Reference Cheat Sheet
+## Features
 
-| Table | Role in this workflow |
+### Resume Parsing & Storage
+- Parse a `.tex` resume with an LLM — extracts structured sections (experience, projects, skills, education, achievements, coursework)
+- Each section and section-item is stored in SQLite and embedded into ChromaDB for semantic retrieval
+- Multiple resume versions for the same user are supported; the system automatically picks the most JD-relevant version of each section
+
+### JD Parsing
+- Extracts role, company, required skills, nice-to-have skills, and responsibilities from raw JD text
+- De-duplicates JDs by content hash so parsing only runs once per unique JD
+- Embeds the JD into ChromaDB for retrieval queries
+
+### Semantic Retrieval (RAG)
+- Queries ChromaDB with the JD skills + responsibilities as query texts
+- Two-stage fusion reranking: CombMNZ within groups (required skills, responsibilities, nice-to-have) then weighted CombSUM across groups
+- Retrieval is scoped per user — picks the best version of each section across all of that user's resume history
+
+### Interactive Editing Session (LangGraph)
+- Section-by-section AI edit suggestions with side-by-side diff view
+- Actions per section: **Accept**, **Reject**, **Paraphrase**, **Custom instruction**, **Another suggestion**
+- Full edit history per section with one-click restore to any previous version
+- Back-navigation to re-review previous sections
+- Multi-cycle support: after reviewing all sections the system scores the result, then offers a **Refine** pass (re-runs LLM with score feedback) or **Finish**
+
+### Resume Scoring
+- Three dimensions: **Keyword Match** (coverage + embedding similarity), **ATS Friendliness** (LLM), **Resume Quality** (LLM)
+- Per-dimension scores, reasoning, and improvement suggestions
+- Missing required keywords highlighted
+
+### Document Generation
+- Generate **Cover Letter**, **HR Email**, and **Outreach Message** at any point:
+  - **Quick Generate (welcome screen)** — skips editing entirely, uses JD-similarity to auto-select best sections
+  - **Quick Generate (post-parse)** — after JD is parsed and sections are retrieved, generate without entering the edit loop
+  - **Session Generate** — generate using the tailored resume from an active editing session
+  - **Post-session Generate** — generate after finishing the editing session
+
+### Live Resume Layout Customisation
+- Available at the end of an editing session (Refine / Finish screen)
+- Adjust **section order** (↑ / ↓ per section), **font size** (10 / 11 / 12 pt), **section spacing**, and **item spacing**
+- Click "Build Preview" to see the rendered PDF preview and download `.tex` / `.pdf`
+
+### Full LaTeX Preview
+- Compile the resume to PDF at any point during or after editing
+- Rendered as a PNG image in the browser; falls back to syntax-highlighted LaTeX source if `pdflatex` is not installed
+
+---
+
+## Requirements
+
+| Tool | Purpose |
 |---|---|
-| `users` | Identity anchor — `user_id` threads through every table |
-| `resumes` | Master resume record, holds `resume_path` to the `.tex` file |
-| `resume_sections` | One row per section (experience, projects, skills, …) — holds full section blob |
-| `resume_section_items` | One row per atomic block (one company, one project) — holds `content_latex`, `content_text`, `is_master`, `section_id` FK |
-| `jobs` | One row per unique JD — deduplicated by `raw_hash` |
-| `skills` | Normalised skill vocabulary |
-| `job_skills` | JD ↔ skill join (`is_required` flag) |
-| `resume_skills` | Resume ↔ skill join (user's demonstrated skills) |
-| `applications` | Ties a `user_id` to a `job_id`; tracks `status`, `similarity_score`, `current_latex_snapshot` |
-| `resume_edits` | Sentence-level edit log with full undo/redo tree via `parent_edit_id` |
-| `generated_outputs` | All LLM-generated artefacts (drafts, cover letter, email) keyed to `application_id` |
+| Python ≥ 3.13 | Runtime |
+| [uv](https://docs.astral.sh/uv/) | Package manager (replaces pip/venv) |
+| MiKTeX or TeX Live | LaTeX compilation for PDF preview (optional) |
+
+API keys required in `.env`:
+- `GEMINI_API_KEY` — used for all LLM calls (parsing, editing, scoring, generation)
+- `HUGGING_FACE_TOKEN` — used for the `all-mpnet-base-v2` sentence-transformer embedding model
 
 ---
 
-## Stage 0 — Entry & Duplicate Guard
+## Setup
 
-**Inputs:** `user_id`, `resume_id`, `jd_raw` text.
+```bash
+# 1. Clone
+git clone <repo-url>
+cd job-assistant
 
-```
-READ  users          WHERE id = user_id
-READ  resumes        WHERE id = resume_id AND user_id = user_id
-```
+# 2. Copy and fill in the environment file
+cp .env.example .env
+# Edit .env — set GEMINI_API_KEY, HUGGING_FACE_TOKEN, BASE_DIR, etc.
 
-**Duplicate check:**
+# 3. Install dependencies
+uv sync
 
-```
-hash(jd_raw) → raw_hash
+# 4. Initialise the database
+uv run python db/init_db.py
 
-READ  jobs           WHERE raw_hash = raw_hash
-```
-
-| `jobs` lookup result | Next action |
-|---|---|
-| **Miss** — no matching `raw_hash` | Proceed to Stage 1 (parse JD) |
-| **Hit** — job exists | Check `applications WHERE user_id = ? AND job_id = ?` |
-| Hit + application exists + `generated_outputs.is_draft = 0` | Return the final output. **Stop.** |
-| Hit + application exists + only `is_draft = 1` rows | Skip Stage 1 & 2. Resume from Stage 3. |
-| Hit + no application yet | Create application row, skip Stage 1. Proceed to Stage 2. |
-
-**On new application:**
-```
-INSERT applications (
-    user_id, job_id,
-    status          = 'draft',
-    updated_at      = NOW()
-)
-→ app_id
+# 5. Run any pending migrations
+uv run python db/migrate.py
 ```
 
 ---
 
-## Stage 1 — JD Parsing
+## Starting the App
 
-**Goal:** Decompose the raw JD into structured fields and a normalised skill list.
+Open two terminals:
 
-**Run:** `JDParser(jd_raw)` — extracts company, role, responsibilities, required/nice-to-have skills, seniority, location, remote flag, and a structured JSON summary.
+```bash
+# Terminal 1 — FastAPI backend
+uv run uvicorn app.api.main:app --reload
 
-**Writes:**
-
-```
-INSERT jobs (
-    user_id, jd_raw,
-    company, role,
-    jd_parsed        = <structured JSON from parser>,
-    seniority_level, location, is_remote,
-    source_url,
-    raw_hash         = hash(jd_raw),
-    parsed_hash      = hash(jd_parsed)
-)
-→ job_id
-
-UPDATE applications SET job_id = job_id WHERE id = app_id
+# Terminal 2 — Streamlit frontend
+uv run streamlit run streamlit_app.py
 ```
 
-**For each extracted skill:**
+The Streamlit UI is available at `http://localhost:8501`.
+The API docs (Swagger) are at `http://localhost:8000/docs`.
+
+---
+
+## How to Use
+
+### First time — upload your resume
+1. In the sidebar, select **"Upload new .tex file"** and upload your LaTeX resume.
+2. Paste the job description into the **"Job Description"** text area.
+3. Click **"🔍 Parse JD & Resume"**.
+
+### Subsequent jobs — use your saved profile
+1. In the sidebar, select **"Use profile from DB"** and choose your candidate profile.
+2. Paste the job description.
+3. Click **"🔍 Parse JD & Resume"**.
+
+### After parsing — choose your path
+The system retrieves the most relevant resume sections and shows them with relevance scores. You now have two options:
+
+**✨ Quick Generate tab**
+- Select document types (Cover Letter, HR Email, Outreach Message)
+- Click **"Generate Now"** — done in seconds, no editing required
+
+**📝 Start Editing Session tab**
+- Click **"Start Editing Session"** to enter the interactive editing loop
+- Review each section one at a time; accept, reject, paraphrase, or give a custom instruction
+- After all sections: view your score, optionally **Refine** (re-run with score feedback), then **Finish**
+- In the **Refine / Finish** screen: preview the resume, customise the layout, and generate cover letter / email / outreach
+
+### Welcome screen Quick Generate
+If you just want to generate documents without any parsing step at all:
+1. Select a saved profile in the sidebar
+2. Paste the JD
+3. On the welcome screen, open the **✨ Quick Generate** tab and click **"Generate Now"**
+
+---
+
+## Running Tests
+
+```bash
+uv run pytest tests/
 ```
-UPSERT skills (name, category)          → skill_id
-INSERT job_skills (job_id, skill_id, is_required)
-```
 
-> `is_required = 1` for explicitly required skills, `0` for nice-to-have.
-
-**Compute skill overlap against the user's resume:**
-```
-READ  resume_skills  WHERE user_id = user_id   → user_skill_ids
-READ  job_skills     WHERE job_id = job_id     → jd_skill_ids
-
-overlap_count = len(intersection(user_skill_ids, jd_skill_ids))
-
-UPDATE applications SET skill_overlap_count = overlap_count
+To reset the test database:
+```bash
+uv run python tests/resetdb.py
 ```
 
 ---
 
-## Stage 2 — Semantic Retrieval (RAG)
-
-**Goal:** Pull only the resume blocks most relevant to this JD — not the whole resume.
-
-### Step A — Query ChromaDB
-
-Use the responsibilities extracted in Stage 1 as the query text.
-
-```python
-results = chroma_col.query(
-    query_texts = jd_responsibilities,   # list of strings from jd_parsed
-    n_results   = TOP_K,
-    where       = {"resume_id": resume_id}
-)
-# Each result carries metadata: sql_id, section_type, item_name, role_title
-```
-
-ChromaDB IDs follow the convention `sec_item_{sql_id}`, where `sql_id` maps directly to `resume_section_items.id`.
-
-### Step B — Fetch Atomic Items from SQL
+## File & Folder Reference
 
 ```
-READ  resume_section_items
-WHERE id IN (<sql_ids from ChromaDB results>)
-  AND is_master = 1
-→ returns: id, section_id, section_name, item_name, role_title,
-           content_latex, content_text, item_index
+job-assistant/
+│
+├── streamlit_app.py          # Entire Streamlit UI — sidebar, all interrupt screens,
+│                             #   welcome / quick-generate, layout customiser
+│
+├── main.py                   # Thin entry point (imports FastAPI app)
+│
+├── app/
+│   ├── api/
+│   │   ├── main.py           # FastAPI app creation, router registration, /health
+│   │   ├── deps.py           # Shared FastAPI dependencies
+│   │   └── routes/
+│   │       ├── edit.py       # All editing-session endpoints:
+│   │       │                 #   POST /edit/start, /{tid}/resume, /{tid}/score,
+│   │       │                 #   /{tid}/preview, /{tid}/generate,
+│   │       │                 #   /{tid}/generate-from-items, /quick-generate
+│   │       ├── resume.py     # Resume upload, list, user profiles  (GET /resume/users)
+│   │       ├── jd.py         # Standalone JD parse endpoint
+│   │       ├── generate.py   # Standalone generation endpoint
+│   │       └── score.py      # Standalone score endpoint
+│   │
+│   ├── graph/
+│   │   ├── edit_graph.py     # LangGraph StateGraph for the editing session:
+│   │   │                     #   node_parse_and_retrieve → item_selection interrupt
+│   │   │                     #   → node_build_edit_state → node_suggest
+│   │   │                     #   → section_review interrupt (per section)
+│   │   │                     #   → refine_or_finish interrupt → done
+│   │   ├── generation_graph.py  # (optional) LangGraph for generation flow
+│   │   └── state.py          # EditGraphState TypedDict
+│   │
+│   ├── agents/
+│   │   ├── edit_agent.py     # EditAgent — holds ResumeEditCycle, calls LLM for
+│   │   │                     #   suggestions and section edits, manages history tree
+│   │   ├── score_agent.py    # score() — keyword coverage + semantic + LLM scoring
+│   │   ├── generator_agent.py# generate() — cover letter / email / outreach via LLM
+│   │   └── orchestrator.py   # High-level orchestration helpers
+│   │
+│   ├── core/
+│   │   ├── pipeline.py       # Thin facade over all core modules — the single
+│   │   │                     #   import used by graph nodes and API routes
+│   │   ├── jd_parser.py      # JDParser — LLM extracts structured JD, saves to
+│   │   │                     #   SQLite + embeds to ChromaDB
+│   │   ├── resume_parser.py  # ResumeParser — LLM extracts structured resume,
+│   │   │                     #   saves sections/items to SQLite + ChromaDB
+│   │   ├── retriever.py      # ResumeRetriever — ChromaDB queries, two-stage
+│   │   │                     #   CombMNZ/CombSUM reranking, rank_and_filter
+│   │   └── resume_builder.py # ResumeBuilder — assembles final LaTeX from sections;
+│   │                         #   accepts section_order, font_size, spacing overrides
+│   │
+│   ├── models/
+│   │   ├── jd.py             # ParsedJD pydantic model
+│   │   ├── resume.py         # ParsedResume, PersonalInfo, ResumeSection, AtomicItem
+│   │   ├── edit.py           # ResumeEditState, ResumeEditCycle, SectionEditState,
+│   │   │                     #   ItemEditState
+│   │   ├── scoring.py        # ResumeScore, DimensionScore, LLMScoreOutput
+│   │   ├── generation.py     # Generation request/response models
+│   │   ├── resume_builder.py # ResumeBuilderInput
+│   │   └── retriever.py      # Retriever result models
+│   │
+│   └── utils/
+│       ├── llm.py            # LLMClient wrapper (Gemini / OpenAI), Prompt dataclass
+│       ├── logger.py         # get_logger() — structured logging setup
+│       ├── sqlite_handler.py # SQLHandler — fetch_one, fetch_table_where,
+│       │                     #   execute_raw wrappers over SQLAlchemy
+│       └── __init__.py       # Re-exports SQLHandler, get_logger
+│
+├── config/
+│   ├── config.ini            # Config template — values injected from .env
+│   └── config.py             # get_config_dict() — loads config.ini + .env,
+│                             #   returns nested dict (cached after first call)
+│
+├── db/
+│   ├── schema.sql            # Full database schema (reference)
+│   ├── init_db.py            # Creates all tables from schema.sql
+│   ├── migrate.py            # Runs numbered migration files in order
+│   └── migrations/           # SQL migration files (001 … 007)
+│
+└── tests/
+    ├── conftest.py           # Pytest fixtures (DB setup, mock clients)
+    ├── resetdb.py            # Wipes and re-initialises the test database
+    ├── test_jd_parser.py     # JDParser unit tests
+    ├── test_resume_parser.py # ResumeParser unit tests
+    ├── test_retriever.py     # ResumeRetriever unit tests
+    ├── test_edit_agent.py    # EditAgent unit tests
+    ├── test_score_agent.py   # ScoreAgent unit tests
+    └── test_generator_agent.py  # GeneratorAgent unit tests
 ```
-
-Fetch the parent section blob for structural context (used in final assembly):
-
-```
-READ  resume_sections
-WHERE id IN (<section_ids from above items>)
-→ returns: id, section_name, content_latex
-```
-
-### Step C — Compute Similarity Score
-
-```python
-similarity_score = mean_cosine_similarity(jd_embedding, retrieved_item_embeddings)
-
-UPDATE applications SET similarity_score = similarity_score
-```
-
----
-
-## Stage 3 — Phase I: Draft Generation
-
-**Goal:** Produce two fast, non-interactive draft resumes as LaTeX.
-
-**Inputs:**
-- `resume_section_items.content_latex` for retrieved atomic items
-- `resume_sections.content_latex` for flat sections (skills, education, etc.) from:
-  ```
-  READ  resume_sections
-  WHERE resume_id = resume_id
-    AND section_name IN ('skills', 'education', 'achievements', 'relevant_coursework')
-  ```
-- `jobs.jd_parsed` — for JD skills and keywords
-- `resumes.resume_path` — for the master LaTeX template/preamble
-
-**LLM Prompt (×2 variants):**
-
-```
-Draft 1 — ATS mode:
-  "Assemble a LaTeX resume from these blocks [content_latex list].
-   Maximise keyword density for: [job_skills WHERE is_required=1].
-   Keep total line count ≤ MAX_LINES."
-
-Draft 2 — Impact mode:
-  "Assemble a LaTeX resume from these blocks [content_latex list].
-   Lead with quantified achievements. Keywords: [job_skills].
-   Keep total line count ≤ MAX_LINES."
-```
-
-**Writes:**
-```
-INSERT generated_outputs (
-    application_id  = app_id,
-    output_type     = 'resume_ats_draft' | 'resume_impact_draft',
-    content         = <full LaTeX string>,
-    model_used      = <model name>,
-    prompt_tokens, completion_tokens,
-    is_draft        = 1
-)
-
-UPDATE applications SET
-    current_latex_snapshot = <draft LaTeX>,
-    updated_at             = NOW()
-```
-
-> `current_latex_snapshot` in `applications` always holds the **latest working state** of the LaTeX, updated after every significant change.
-
----
-
-## Stage 4 — Phase II: Agentic Edit Loop
-
-**Goal:** Sentence-level personalisation with full user control and undo capability.
-
-### The Edit State Machine
-
-Each bullet point in a retrieved `resume_section_items` block is a discrete unit. The agent proposes one edit at a time and waits for user action before proceeding.
-
-```
-resume_edits.status values:
-  'pending'     — agent has proposed, user has not acted yet
-  'accepted'    — user accepted suggested_text as final_text
-  'rejected'    — user discarded, original_text stands
-  'paraphrased' — user modified; a child edit was created via parent_edit_id
-```
-
-### Loop Logic
-
-```python
-for item in retrieved_section_items:           # resume_section_items rows
-    sentences = split_latex_into_sentences(item.content_latex)
-
-    for idx, sentence in enumerate(sentences):
-        proposed = agent.propose(sentence, jd_context)
-
-        # --- WRITE: log the pending edit ---
-        INSERT resume_edits (
-            application_id = app_id,
-            section        = item.section_name,   # 'experience', 'projects', etc.
-            original_text  = sentence,
-            suggested_text = proposed,
-            status         = 'pending',
-            sentence_index = idx,                 # position within this item's bullets
-            line_count_delta = line_delta(sentence, proposed),
-            parent_edit_id = NULL                 # root edit
-        ) → edit_id
-
-        action = wait_for_user(edit_id)           # API/frontend pauses here
-
-        if action == 'accept':
-            UPDATE resume_edits SET
-                final_text = suggested_text,
-                status     = 'accepted'
-            WHERE id = edit_id
-
-        elif action == 'reject':
-            UPDATE resume_edits SET
-                status = 'rejected'
-            WHERE id = edit_id
-            # original_text is implicitly preserved — no final_text needed
-
-        elif action == 'paraphrase':
-            # User provides feedback → agent re-proposes → new child record
-            new_proposal = agent.re_propose(suggested_text, user_feedback)
-
-            INSERT resume_edits (
-                application_id = app_id,
-                section        = item.section_name,
-                original_text  = sentence,        # always the master original
-                suggested_text = new_proposal,
-                status         = 'pending',
-                sentence_index = idx,
-                line_count_delta = line_delta(sentence, new_proposal),
-                parent_edit_id = edit_id          # links back to the root edit
-            ) → child_edit_id
-            # loop again from wait_for_user with child_edit_id
-
-    # --- After all sentences in this item: snapshot running state ---
-    UPDATE applications SET
-        current_latex_snapshot = assemble_latex(app_id),
-        updated_at             = NOW()
-```
-
-### Revert Logic
-
-Revert walks up the `parent_edit_id` chain:
-
-```python
-def revert(edit_id):
-    READ resume_edits WHERE id = edit_id → edit
-
-    if edit.parent_edit_id is NULL:
-        # Root — restore original_text
-        return edit.original_text
-    else:
-        READ resume_edits WHERE id = edit.parent_edit_id → parent
-        UPDATE resume_edits SET status = 'rejected' WHERE id = edit_id
-        return parent.suggested_text   # restore to previous proposal
-```
-
----
-
-## Stage 5 — Final Assembly & Space Optimisation
-
-**Goal:** Reconstruct the final LaTeX, enforce the one-page constraint, then store all deliverables.
-
-### Step A — Reconstruct LaTeX
-
-For every retrieved `resume_section_items` row, resolve its final text:
-
-```python
-def resolve_item_text(item_id, app_id):
-    """
-    Priority: last accepted edit > original content_latex
-    """
-    READ resume_edits
-    WHERE application_id = app_id
-      AND sentence_index IS NOT NULL
-      AND status = 'accepted'
-    ORDER BY id DESC
-    # Group by sentence_index to get the latest accepted edit per sentence
-
-    if accepted_edits exist for this item:
-        # Splice accepted final_text back into content_latex at sentence_index positions
-        return patched_latex
-    else:
-        READ resume_section_items WHERE id = item_id
-        return content_latex    # untouched original
-```
-
-Flat sections (skills, education, etc.) come directly from `resume_sections.content_latex` — they have no `resume_section_items` children and are never edited in Phase II.
-
-### Step B — Line Pressure Check
-
-```python
-final_latex = assemble_full_latex(resolved_items, flat_sections, template)
-
-total_delta = SUM(
-    SELECT line_count_delta FROM resume_edits
-    WHERE application_id = app_id AND status = 'accepted'
-)
-
-line_count = count_latex_lines(final_latex)
-
-if line_count > MAX_LINES:
-    overage = line_count - MAX_LINES
-    final_latex = agent.condense(
-        latex   = final_latex,
-        message = f"Resume is {overage} lines over limit. "
-                   "Shorten the oldest experience item and summary "
-                   f"while keeping keywords: {required_keywords}."
-    )
-```
-
-### Step C — Write Final Outputs
-
-```
-# Save the compiled resume
-INSERT generated_outputs (
-    application_id = app_id,
-    output_type    = 'resume_final',
-    content        = final_latex,
-    model_used     = <model>,
-    prompt_tokens, completion_tokens,
-    is_draft       = 0              ← marks this as the authoritative output
-)
-
-# Save cover letter
-INSERT generated_outputs (
-    application_id = app_id,
-    output_type    = 'cover_letter',
-    content        = <generated cover letter>,
-    is_draft       = 0
-)
-
-# Save outreach email
-INSERT generated_outputs (
-    application_id = app_id,
-    output_type    = 'hr_email',
-    content        = <generated outreach email>,
-    is_draft       = 0
-)
-
-# Persist the final .tex file path
-UPDATE applications SET
-    resume_version_path    = <path to saved .tex file>,
-    current_latex_snapshot = final_latex,
-    status                 = 'applied',
-    applied_at             = NOW(),
-    updated_at             = NOW()
-```
-
----
-
-## Data Flow Summary
-
-```
-users
- └─ resumes
-     ├─ resume_sections          (one row per section — full blob)
-     │   └─ resume_section_items (one row per company/project — atomic LaTeX)
-     │         [ChromaDB: sec_item_{id}]
-     └─ resume_skills ──► skills ◄── job_skills
-                                          │
-jobs ◄─────────────────────────────────── ┘
- └─ applications (status: draft → applied)
-     ├─ resume_edits             (sentence edits, undo tree via parent_edit_id)
-     └─ generated_outputs        (drafts is_draft=1, finals is_draft=0)
-```
-
----
-
-## RAG vs. Agentic Roles — Clarified
-
-**RAG** (`resume_section_items` + ChromaDB) provides scoped context. Instead of feeding the LLM your entire resume history, it retrieves only the 3–5 atomic blocks semantically closest to the JD responsibilities. This keeps prompts small and relevance high.
-
-**Agentic AI** (`resume_edits`) provides reasoning and persistence. The agent maintains the sentence-level edit state, manages the undo/redo tree through `parent_edit_id`, accumulates `line_count_delta` across all edits to detect page overflow early, and self-corrects in Stage 5 if needed.
-
-The two roles are cleanly separated: RAG handles what to include, the agent handles how to say it.
