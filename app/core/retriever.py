@@ -2,9 +2,10 @@ import json
 import os
 import chromadb
 from chromadb import Collection as ChromaCollection
-from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from typing import Any, List
+
+from app.core.chroma_client import get_chroma_client
 
 from app.models.jd import ParsedJD
 from app.utils import SQLHandler, get_logger
@@ -47,10 +48,7 @@ class ResumeRetriever:
         self.weight_nth = weight_nice_to_have
 
         self.db = SQLHandler()
-        self._chroma_client = chromadb.PersistentClient(
-            path     = chroma_path,
-            settings = Settings(anonymized_telemetry=False),
-        )
+        self._chroma_client = get_chroma_client()
         # Use same EF as resume_parser / jd_parser so query embeddings are consistent
         self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=EMBEDDING_MODEL,

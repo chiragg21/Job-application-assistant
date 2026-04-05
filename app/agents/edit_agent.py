@@ -114,13 +114,17 @@ Only suggest edits for lines that can be improved.
 """
         prompt = f"""
 ## TASK
-Review the LaTeX section and suggest improved wording.
-You will have items under sections - {ATOMIC_SECTIONS}, and you have suggest improvements in each of them while following the OUTPUT Schema for that.
+Review the LaTeX sections below and suggest improved wording.
+
+For flat sections (education, skills, etc.) return an OneLlmOutput with name=null.
+For atomic sections (experience, projects) return one OneLlmOutput per item with
+`name` set to EXACTLY the item name shown in the input (e.g. "GIST Impact", "Job Assistant").
+Return one entry per item even when no changes are needed (use empty lists in that case).
 
 Modify only lines that can be improved.
-Return the exact original lines and their replacements, in the exact same order of sections and there items as in the input.
+Return the exact original lines and their replacements.
 
-If no changes are needed, return empty lists.
+If no changes are needed for an item, return empty lists for that item.
 
 ## INPUT
 {input_str}
@@ -156,11 +160,18 @@ If no changes are needed, return empty lists.
         for sec in ATOMIC_SECTIONS:
             sec_prev_state = getattr(self.editing_cycle.current_state, sec) or []
             sec_item_sugg: list[OneLlmOutput] = getattr(response, sec) or []
+            # Build a name→suggestion map for reliable matching; fall back to
+            # positional index only when the LLM omits the name field.
+            _empty_sugg = OneLlmOutput(lines_to_change=[], suggested_changes=[])
+            sugg_by_name = {s.name: s for s in sec_item_sugg if s and s.name}
             new_sec = []
             for i, item_prev_state in enumerate(sec_prev_state):
                 if item_prev_state is None:
                     continue
-                item_sugg = sec_item_sugg[i] if i < len(sec_item_sugg) else OneLlmOutput(lines_to_change=[], suggested_changes=[])
+                item_sugg = (
+                    sugg_by_name.get(item_prev_state.item_name)
+                    or (sec_item_sugg[i] if i < len(sec_item_sugg) else _empty_sugg)
+                )
                 item_updated_state = item_prev_state.updated_section
                 for prev, new in zip(item_sugg.lines_to_change, item_sugg.suggested_changes):
                     item_updated_state = item_updated_state.replace(prev, new)

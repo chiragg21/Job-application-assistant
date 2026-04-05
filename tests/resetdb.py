@@ -28,7 +28,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 from config.config import get_config_dict
-from utils.logger import get_logger
+from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 
@@ -47,16 +47,23 @@ EMBEDDING_MODEL  = rag_cfg["embedding_model"]
 # Tables in child → parent order so FK constraints are not violated
 SQLITE_TABLES = [
     "job_skills",
-    "skills",
+    "resume_skills",
+    "resume_edits",
+    "generated_outputs",
+    "applications",
+    "resume_section_items",
+    "resume_sections",
+    "resumes",
     "jobs",
-    # add more tables here (child first, parent last)
+    "skills",
+    "users",
 ]
 
 # ChromaDB collections to wipe
 CHROMA_COLLECTIONS = [
     "jd_chunks",
     "cached_jd_outputs",
-    # add more collections here
+    "resume_sections",
 ]
 
 

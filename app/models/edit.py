@@ -6,7 +6,7 @@ from app.models.jd import ParsedJD
 
 
 class OneLlmOutput(BaseModel):
-    # name: str = Field(..., description="name of the section or item of section the update is being performed on")
+    name: Optional[str] = Field(None, description="item_name of the company or project this output applies to; null for flat sections")
     lines_to_change: List[str] = Field(..., description="list of specific lines to be changed from latex content")
     suggested_changes: List[str] = Field(..., description="list of suggestions to replace original lines, also in latex")
 

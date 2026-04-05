@@ -34,6 +34,32 @@ class ResumeParseResponse(BaseModel):
     parsed_resume: dict
 
 
+class PersonalInfoRequest(BaseModel):
+    resume_path: str
+
+
+class PersonalInfoResponse(BaseModel):
+    name:     str | None
+    email:    str | None
+    phone:    str | None
+    github:   str | None
+    linkedin: str | None
+
+
+class CreateUserRequest(BaseModel):
+    name:         str
+    email:        str | None = None
+    phone:        str | None = None
+    github:       str | None = None
+    linkedin:     str | None = None
+    current_role: str | None = None
+    company:      str | None = None
+
+
+class CreateUserResponse(BaseModel):
+    user_id: int
+
+
 class RetrieveRequest(BaseModel):
     job_id:    int
     parsed_jd: dict   # ParsedJD.model_dump()
@@ -135,6 +161,43 @@ async def parse_resume(
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/extract-info", response_model=PersonalInfoResponse)
+def extract_personal_info(req: PersonalInfoRequest):
+    """
+    Extract personal info from a local .tex file path without writing to DB.
+    Used to pre-populate the new-user form in the UI.
+    """
+    try:
+        info = pl.extract_personal_info(req.resume_path)
+        return PersonalInfoResponse(
+            name=info.name     if info.name     not in ("", "Unknown") else None,
+            email=info.email   if info.email    not in ("", "Unknown") else None,
+            phone=info.phone   if info.phone    not in ("", "Unknown") else None,
+            github=info.github  or None,
+            linkedin=info.linkedin or None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/create-user", response_model=CreateUserResponse)
+def create_user(req: CreateUserRequest):
+    """Create a new candidate profile in the users table."""
+    try:
+        user_id = pl.create_user(
+            name=req.name,
+            email=req.email,
+            phone=req.phone,
+            github=req.github,
+            linkedin=req.linkedin,
+            current_role=req.current_role,
+            company=req.company,
+        )
+        return CreateUserResponse(user_id=user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/retrieve", response_model=RetrieveResponse)

@@ -37,6 +37,7 @@ from typing import Optional
 import chromadb
 from chromadb.utils import embedding_functions
 
+from app.core.chroma_client import get_chroma_client
 from app.models.jd import ParsedJD
 from config.config import get_config_dict
 from app.utils.logger import get_logger
@@ -101,9 +102,9 @@ class JDParser:
             model_name=EMBEDDING_MODEL,
             token=HF_TOKEN or None,
         )
-        chroma = chromadb.PersistentClient(path=str(VECTORSTORE_PATH))
-        self._col_jd_chunks = chroma.get_collection(COL_JD_CHUNKS, embedding_function=self.ef)
-        self._col_cached    = chroma.get_collection(COL_CACHED_OUTPUTS, embedding_function=self.ef)
+        chroma = get_chroma_client()
+        self._col_jd_chunks = chroma.get_or_create_collection(COL_JD_CHUNKS, embedding_function=self.ef)
+        self._col_cached    = chroma.get_or_create_collection(COL_CACHED_OUTPUTS, embedding_function=self.ef)
 
         log.info("JDParser ready")
 

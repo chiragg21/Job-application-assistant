@@ -10,6 +10,8 @@ from app.models.resume import (
 import chromadb
 from chromadb.utils import embedding_functions
 
+from app.core.chroma_client import get_chroma_client
+
 from config.config import get_config_dict
 _cfg       = get_config_dict()
 resume_cnf = _cfg['resume_defaults']
@@ -48,7 +50,7 @@ class ResumeParser:
             model_name=embedding_model,
             token=_HF_TOKEN or None,
         )
-        self.chroma_client = chromadb.PersistentClient(path=str(vector_path))
+        self.chroma_client = get_chroma_client()
 
         self.col_resume = self.chroma_client.get_or_create_collection(
             name="resume_sections",
@@ -176,9 +178,12 @@ class ResumeParser:
             -> Treated as a single item with name extracted if present,
                or name=None if the section has no leading \\textbf{} at all.
         """
-        # Split ONLY on \textbf that starts a line (^ with MULTILINE)
-        # The lookahead keeps the \textbf token at the start of each block.
-        header_pattern = re.compile(r'(?m)(?=^\s*\\textbf\{)')
+        # Split ONLY on \textbf that starts a line AND is followed by \hfill
+        # on the same line — that combination uniquely identifies section-header
+        # lines (e.g. "\textbf{Company} \hfill \textit{Date} \\").
+        # Inline bold inside bullet points never has \hfill, so they are
+        # never mistaken for block headers even when they start a wrapped line.
+        header_pattern = re.compile(r'(?m)(?=^\s*\\textbf\{[^}]+\}[^\n]*\\hfill)')
         raw_blocks = header_pattern.split(section_latex)
 
         # Filter out empty fragments (e.g. whitespace before the first header)

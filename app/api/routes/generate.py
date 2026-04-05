@@ -13,9 +13,11 @@ VALID_TYPES = {"coverletter", "email", "outreachmessage"}
 
 
 class GenerateRequest(BaseModel):
-    parsed_jd:        dict              # ParsedJD.model_dump()
-    parsed_resume:    dict              # ParsedResume.model_dump()
-    generation_types: list[str]         # one or more of the VALID_TYPES
+    parsed_jd:          dict              # ParsedJD.model_dump()
+    parsed_resume:      dict              # ParsedResume.model_dump()
+    generation_types:   list[str]         # one or more of the VALID_TYPES
+    custom_instruction: str | None = None
+    no_jd:              bool       = False
 
 
 class GenerateResponse(BaseModel):
@@ -43,9 +45,11 @@ def generate_documents(req: GenerateRequest):
 
     try:
         result = generation_graph.invoke({
-            "parsed_jd":        req.parsed_jd,
-            "parsed_resume":    req.parsed_resume,
-            "generation_types": normalised,
+            "parsed_jd":          req.parsed_jd,
+            "parsed_resume":      req.parsed_resume,
+            "generation_types":   normalised,
+            "custom_instruction": req.custom_instruction,
+            "no_jd":              req.no_jd,
         })
         return GenerateResponse(
             results=result.get("results", {}),

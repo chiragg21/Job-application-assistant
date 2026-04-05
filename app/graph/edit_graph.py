@@ -125,18 +125,23 @@ def node_parse_and_retrieve(state: EditGraphState) -> dict:
             job_id, parsed_jd        = jd_fut.result()
             resume_id, parsed_resume = res_fut.result()
 
-        # ── Phase 2: retrieve, scoped to this user's resumes ───────────
-        # Get all resume IDs for this user so retrieval picks the most
-        # JD-relevant version of each section-item from their history.
-        user_resume_ids = pl.get_user_resume_ids(user_id)
-        log.info("[graph] user_id=%s has %d resume(s): %s", user_id, len(user_resume_ids), user_resume_ids)
-
-        raw_results = pl.retrieve(
-            job_id=job_id,
-            parsed_jd=parsed_jd,
-            resume_ids=user_resume_ids if user_resume_ids else None,
-        )
-        ranked = pl.rank_and_filter(raw_results)
+        # ── Phase 2: retrieve or load directly ────────────────────────
+        # When the user uploads a new resume we use its sections as-is
+        # (no retrieval needed — there is nothing to rank against yet).
+        # When they pick an existing resume we retrieve across their full
+        # history to surface the most JD-relevant version of each section.
+        if resume_path:
+            log.info("[graph] new upload — skipping retrieval, loading sections from resume_id=%s", resume_id)
+            ranked = pl.load_ranked_items_from_resume(resume_id)
+        else:
+            user_resume_ids = pl.get_user_resume_ids(user_id)
+            log.info("[graph] user_id=%s has %d resume(s): %s", user_id, len(user_resume_ids), user_resume_ids)
+            raw_results = pl.retrieve(
+                job_id=job_id,
+                parsed_jd=parsed_jd,
+                resume_ids=user_resume_ids if user_resume_ids else None,
+            )
+            ranked = pl.rank_and_filter(raw_results)
 
         return {
             "job_id":        job_id,

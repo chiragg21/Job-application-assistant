@@ -76,6 +76,35 @@ def parse_resume(resume_path: str | Path, user_id: int) -> tuple[int, ParsedResu
     return resume_id, parsed_resume
 
 
+def extract_personal_info(resume_path: str | Path) -> PersonalInfo:
+    """Read a LaTeX resume and return its PersonalInfo without any DB writes."""
+    parser = _get_resume_parser()
+    latex  = Path(resume_path).read_text(encoding="utf-8", errors="replace")
+    return parser.extract_personal_info(parser._strip_comments(latex))
+
+
+def create_user(
+    name: str,
+    email: str | None = None,
+    phone: str | None = None,
+    github: str | None = None,
+    linkedin: str | None = None,
+    current_role: str | None = None,
+    company: str | None = None,
+) -> int:
+    """Insert a row into the users table and return the new user_id."""
+    db = SQLHandler()
+    return db.add_one("users", {
+        "name":         name,
+        "email":        email        or "",
+        "phone_number": phone        or "",
+        "github":       github       or "",
+        "linkedin":     linkedin     or "",
+        "current_role": current_role or "",
+        "Company":      company      or "",
+    })
+
+
 def get_user_resume_ids(user_id: int) -> list[int]:
     """Return all resume IDs stored in the DB for a given user_id."""
     db   = SQLHandler()
@@ -98,6 +127,20 @@ def load_latest_resume_for_user(user_id: int) -> tuple[int, ParsedResume]:
     return load_resume_from_db(int(row[0]["id"]))
 
 
+def _db_str(val) -> str | None:
+    """Convert a DB/pandas value to str | None, handling float NaN from pandas."""
+    import math
+    if val is None:
+        return None
+    try:
+        if math.isnan(float(val)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(val).strip()
+    return s if s else None
+
+
 def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
     """
     Reconstruct a ParsedResume entirely from SQLite — no file access needed.
@@ -110,11 +153,11 @@ def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
         raise ValueError(f"No resume found in DB with id={resume_id}")
 
     personal_info = PersonalInfo(
-        name=row.get("name") or "Unknown",
-        email=row.get("email") or "",
-        phone=row.get("phone") or "",
-        github=row.get("github_url") or "",
-        linkedin=row.get("linkedin_url") or "",
+        name=_db_str(row.get("name")) or "Unknown",
+        email=_db_str(row.get("email")) or "",
+        phone=_db_str(row.get("phone")) or "",
+        github=_db_str(row.get("github_url")) or "",
+        linkedin=_db_str(row.get("linkedin_url")) or "",
     )
 
     sections_df = db.fetch_table_where("resume_sections", filters={"resume_id": resume_id})
@@ -126,8 +169,8 @@ def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
         sec_name = sec_row["section_name"]
         if sec_name in FLAT_SECTIONS:
             flat[sec_name] = SectionContent(
-                content_latex=sec_row.get("content_latex") or None,
-                content_text=sec_row.get("content_text") or None,
+                content_latex=_db_str(sec_row.get("content_latex")),
+                content_text=_db_str(sec_row.get("content_text")),
             )
         elif sec_name in ATOMIC_SECTIONS:
             items = db.execute_raw(
@@ -139,10 +182,10 @@ def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
             if isinstance(items, list):
                 for item in items:
                     atomic[sec_name].append(AtomicItem(
-                        name=item.get("item_name"),
-                        role=item.get("role_title"),
-                        content_latex=item.get("content_latex") or "",
-                        content_text=item.get("content_text") or "",
+                        name=_db_str(item.get("item_name")),
+                        role=_db_str(item.get("role_title")),
+                        content_latex=_db_str(item.get("content_latex")) or "",
+                        content_text=_db_str(item.get("content_text")) or "",
                     ))
 
     resume_sections = ResumeSection(
@@ -156,7 +199,7 @@ def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
 
     return resume_id, ParsedResume(
         resume_id=str(resume_id),
-        resume_path=row.get("resume_path") or "",
+        resume_path=_db_str(row.get("resume_path")) or "",
         personal_info=personal_info,
         resume_sections=resume_sections,
     )
@@ -204,6 +247,53 @@ def rank_and_filter(
         ]
     """
     return _get_retriever().rank_and_filter(run_results)
+
+
+def load_ranked_items_from_resume(resume_id: int) -> list[dict]:
+    """
+    Build a ranked_items list directly from DB rows for a given resume,
+    bypassing ChromaDB retrieval entirely.
+
+    Used when the user uploads a new resume — we use that resume's own
+    sections rather than searching across historical versions.
+
+    Returns the same format as rank_and_filter():
+        [{"section_name": str, "item_name": str|None, "scores": [1.0], "rows": [dict]}, ...]
+    """
+    db = SQLHandler()
+    items: list[dict] = []
+
+    # Flat sections — one row per section from resume_sections
+    for sec_name in FLAT_SECTIONS:
+        row = db.fetch_one(
+            "resume_sections",
+            filters={"resume_id": resume_id, "section_name": sec_name},
+        )
+        if row and row.get("content_latex"):
+            items.append({
+                "section_name": sec_name,
+                "item_name":    None,
+                "scores":       [1.0],
+                "rows":         [dict(row)],
+            })
+
+    # Atomic sections — one entry per item from resume_section_items
+    for sec_name in ATOMIC_SECTIONS:
+        rows = db.execute_raw(
+            "SELECT * FROM resume_section_items WHERE resume_id = :rid AND section_name = :sec ORDER BY item_index",
+            {"rid": resume_id, "sec": sec_name},
+        ) or []
+        for row in rows:
+            if row.get("content_latex"):
+                items.append({
+                    "section_name": sec_name,
+                    "item_name":    row.get("item_name"),
+                    "scores":       [1.0],
+                    "rows":         [dict(row)],
+                })
+
+    log.info("load_ranked_items_from_resume | resume_id=%d items=%d", resume_id, len(items))
+    return items
 
 
 # ------------------------------------------------------------------
@@ -335,11 +425,17 @@ def score_resume(
     for sec in FLAT_SECTIONS:
         sec_state = getattr(state, sec, None)
         if sec_state and sec_state.updated_section:
-            latex_parts.append(sec_state.updated_section)
+            header = sec.replace("_", " ").title()
+            latex_parts.append(f"\\section*{{{header}}}\n{sec_state.updated_section}")
     for sec in ATOMIC_SECTIONS:
-        for item in (getattr(state, sec, None) or []):
-            if item and item.updated_section:
-                latex_parts.append(item.updated_section)
+        items_latex = [
+            item.updated_section
+            for item in (getattr(state, sec, None) or [])
+            if item and item.updated_section
+        ]
+        if items_latex:
+            header = sec.replace("_", " ").title()
+            latex_parts.append(f"\\section*{{{header}}}\n" + "\n\n".join(items_latex))
 
     return score_resume_fn(
         app_id=app_id,
@@ -443,9 +539,17 @@ def collapse_edit_state_to_resume(
 # ------------------------------------------------------------------
 
 def generate_output(
-    parsed_jd: ParsedJD,
+    parsed_jd: ParsedJD | None,
     resume_source: ParsedResume,
-    generation_type: str,       # "coverletter" | "email" | "outreachmessage"
+    generation_type: str,               # "coverletter" | "email" | "outreachmessage"
+    custom_instruction: str | None = None,
+    no_jd: bool = False,
 ) -> str:
     """Generate a cover letter, HR email, or outreach message."""
-    return generate_fn(resume=resume_source, jd=parsed_jd, type=generation_type)
+    return generate_fn(
+        resume=resume_source,
+        jd=parsed_jd,
+        type=generation_type,
+        custom_instruction=custom_instruction,
+        no_jd=no_jd,
+    )

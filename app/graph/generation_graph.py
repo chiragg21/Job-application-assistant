@@ -45,16 +45,21 @@ def node_generate_all(state: GenerationGraphState) -> dict:
     results: dict[str, str] = {}
     errors:  list[str]      = []
 
+    custom_instruction = state.get("custom_instruction") or None
+    no_jd              = bool(state.get("no_jd", False))
+
     for gen_type in gen_types:
         if gen_type not in VALID_TYPES:
             errors.append(f"Unknown generation type: '{gen_type}'")
             continue
         try:
-            log.info("[gen_graph] generating %s", gen_type)
+            log.info("[gen_graph] generating %s (no_jd=%s)", gen_type, no_jd)
             results[gen_type] = pl.generate_output(
                 parsed_jd=parsed_jd,
                 resume_source=parsed_resume,
                 generation_type=gen_type,
+                custom_instruction=custom_instruction,
+                no_jd=no_jd,
             )
         except Exception as exc:
             log.error("[gen_graph] %s failed: %s", gen_type, exc)

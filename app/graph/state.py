@@ -88,6 +88,10 @@ class GenerationGraphState(TypedDict, total=False):
     # Which outputs to generate (list of generation_type strings)
     generation_types: list[str]   # e.g. ["coverletter", "email", "outreachmessage"]
 
+    # Optional generation modifiers
+    custom_instruction: str | None   # free-text extra instruction injected into every prompt
+    no_jd:              bool         # True → cold-outreach mode, JD is ignored
+
     # ------------------------------------------------------------------ #
     # Outputs                                                              #
     # ------------------------------------------------------------------ #

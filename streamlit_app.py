@@ -8,6 +8,7 @@ Run with:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -28,6 +29,33 @@ _SECTION_LABELS = {
     "relevant_coursework": "Relevant Coursework",
 }
 _DEFAULT_SECTION_ORDER = ["education", "achievements", "experience", "projects", "skills", "relevant_coursework"]
+
+
+def _present_sections() -> list[str]:
+    """Return only sections that have content in the current parsed resume."""
+    pr = st.session_state.get("parsed_resume") or {}
+    rs = pr.get("resume_sections") or {}
+    present = []
+    for sec in _DEFAULT_SECTION_ORDER:
+        val = rs.get(sec)
+        if val is None:
+            continue
+        if isinstance(val, list) and len(val) > 0:        # atomic (experience, projects)
+            present.append(sec)
+        elif isinstance(val, dict) and val.get("content_latex"):  # flat (skills, etc.)
+            present.append(sec)
+    return present if present else _DEFAULT_SECTION_ORDER.copy()
+
+
+def _default_filename(ext: str) -> str:
+    """Build resume_{candidate}_{company}.{ext} from session state."""
+    pr  = st.session_state.get("parsed_resume") or {}
+    pi  = pr.get("personal_info") or {}
+    pj  = st.session_state.get("parsed_jd") or {}
+    raw_name    = pi.get("name", "candidate") or "candidate"
+    raw_company = pj.get("company", "company") or "company"
+    slug = lambda s: re.sub(r"[^a-zA-Z0-9]+", "_", s.strip()).strip("_") or "unknown"
+    return f"resume_{slug(raw_name)}_{slug(raw_company)}.{ext}"
 
 # ── page config ────────────────────────────────────────────────────────────────
 
@@ -199,16 +227,35 @@ def generation_panel(thread_id: str, key_prefix: str = "gen"):
     """Generate cover letter / email / outreach using the tailored resume."""
     st.subheader("Generate Documents")
 
+    _type_labels = {
+        "coverletter":     "📝 Cover Letter",
+        "email":           "📧 HR Email",
+        "outreachmessage": "💬 Outreach Message",
+    }
+
     gen_types = st.multiselect(
         "Documents to generate",
-        ["coverletter", "email", "outreachmessage"],
+        list(_type_labels.keys()),
         default=["coverletter"],
-        format_func=lambda x: {
-            "coverletter":     "📝 Cover Letter",
-            "email":           "📧 HR Email",
-            "outreachmessage": "💬 Outreach Message",
-        }[x],
+        format_func=lambda x: _type_labels[x],
         key=f"{key_prefix}_types",
+    )
+
+    no_jd = st.checkbox(
+        "Cold-outreach mode (no specific JD)",
+        value=False,
+        key=f"{key_prefix}_no_jd",
+        help="Use this for cold emails / outreach when you don't have a job posting — "
+             "the LLM won't anchor to any JD and will highlight your general strengths.",
+    )
+
+    custom_instruction = st.text_area(
+        "Custom instructions (optional)",
+        value="",
+        height=80,
+        placeholder="e.g. 'Keep it under 150 words', 'Address the email to Sarah at Acme', "
+                    "'Emphasise my ML experience', 'Write in a casual tone'…",
+        key=f"{key_prefix}_custom_instruction",
     )
 
     if st.button("✨ Generate", type="primary", key=f"{key_prefix}_btn"):
@@ -219,24 +266,22 @@ def generation_panel(thread_id: str, key_prefix: str = "gen"):
                 gdata, err = api(
                     "post",
                     f"/edit/{thread_id}/generate",
-                    json={"generation_types": gen_types},
+                    json={
+                        "generation_types":   gen_types,
+                        "custom_instruction": custom_instruction.strip() or None,
+                        "no_jd":              no_jd,
+                    },
                 )
             if err:
                 st.error(err)
             else:
                 st.session_state[f"{key_prefix}_results"] = gdata.get("results", {})
                 if gdata.get("errors"):
-                    st.warning(f"Partial errors: {gdata['errors']}")
-                st.rerun()
+                    st.error(f"Generation errors: {gdata['errors']}")
 
     results = st.session_state.get(f"{key_prefix}_results", {})
     for doc_type, content in results.items():
-        title = {
-            "coverletter":     "📝 Cover Letter",
-            "email":           "📧 HR Email",
-            "outreachmessage": "💬 Outreach Message",
-        }.get(doc_type, doc_type)
-        with st.expander(title, expanded=True):
+        with st.expander(_type_labels.get(doc_type, doc_type), expanded=True):
             st.markdown(content)
             st.download_button(
                 f"⬇️ Download {doc_type}.txt",
@@ -268,6 +313,10 @@ def _init():
         # inline preview shown during section_review
         "inline_preview_latex": "",
         "quick_gen_results":    {},
+        # new-upload user-creation flow
+        "personal_info_preview":   None,   # PersonalInfo dict from extract-info
+        "new_user_created":        False,  # True once create-user succeeds for this upload
+        "uploaded_filename":       None,   # tracks which file triggered the current form
         # layout customization (used in refine_or_finish)
         "custom_section_order":    None,   # None → use server default
         "custom_font_size":        11,
@@ -320,14 +369,66 @@ with st.sidebar:
             "LaTeX resume (.tex)", type=["tex"], label_visibility="collapsed"
         )
         if uploaded:
-            raw_bytes = uploaded.read()
-            tex_str   = raw_bytes.decode("utf-8", errors="replace")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".tex", mode="wb") as tmp:
-                tmp.write(raw_bytes)
-                st.session_state["resume_path"]        = tmp.name
+            # Only process when a genuinely different file is selected
+            if uploaded.name != st.session_state.get("uploaded_filename"):
+                raw_bytes = uploaded.read()
+                tex_str   = raw_bytes.decode("utf-8", errors="replace")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".tex", mode="wb") as tmp:
+                    tmp.write(raw_bytes)
+                    tmp_resume_path = tmp.name
+                st.session_state["resume_path"]        = tmp_resume_path
                 st.session_state["existing_resume_id"] = None
-            st.session_state["resume_tex"] = tex_str
-            st.success(f"Loaded: {uploaded.name}")
+                st.session_state["resume_tex"]         = tex_str
+                st.session_state["new_user_created"]   = False
+                st.session_state["uploaded_filename"]  = uploaded.name
+                with st.spinner("Extracting personal info…"):
+                    info_data, info_err = api(
+                        "post", "/resume/extract-info",
+                        json={"resume_path": tmp_resume_path},
+                    )
+                st.session_state["personal_info_preview"] = info_data if not info_err else {}
+
+        # ── New-user form ──────────────────────────────────────────────────
+        if st.session_state.get("resume_path") and not st.session_state.get("new_user_created"):
+            pi = st.session_state.get("personal_info_preview") or {}
+            st.markdown("**Your profile** — confirm or complete the details below:")
+            with st.form("new_user_form", border=True):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    f_name  = st.text_input("Full name *", value=pi.get("name") or "")
+                    f_email = st.text_input("Email",       value=pi.get("email") or "")
+                    f_phone = st.text_input("Phone",       value=pi.get("phone") or "")
+                with col_b:
+                    f_github   = st.text_input("GitHub URL",  value=pi.get("github") or "")
+                    f_linkedin = st.text_input("LinkedIn URL", value=pi.get("linkedin") or "")
+                    f_role     = st.text_input("Current role (optional)", value="")
+                    f_company  = st.text_input("Current company (optional)", value="")
+                submitted = st.form_submit_button("✅ Create profile & continue", type="primary")
+                if submitted:
+                    if not f_name.strip():
+                        st.error("Full name is required.")
+                    else:
+                        user_data, user_err = api(
+                            "post", "/resume/create-user",
+                            json={
+                                "name":         f_name.strip(),
+                                "email":        f_email.strip() or None,
+                                "phone":        f_phone.strip() or None,
+                                "github":       f_github.strip() or None,
+                                "linkedin":     f_linkedin.strip() or None,
+                                "current_role": f_role.strip() or None,
+                                "company":      f_company.strip() or None,
+                            },
+                        )
+                        if user_err:
+                            st.error(f"Could not create profile: {user_err}")
+                        else:
+                            st.session_state["user_id"]        = user_data["user_id"]
+                            st.session_state["new_user_created"] = True
+                            st.rerun()
+
+        if st.session_state.get("new_user_created"):
+            st.success(f"Profile created — user ID {st.session_state['user_id']}")
 
     else:
         # ── User (candidate) selector ──────────────────────────────────
@@ -431,6 +532,8 @@ with st.sidebar:
             st.error("Paste a job description first.")
         elif not rp and not existing_id and not db_users:
             st.error("Upload a .tex resume or select a saved profile.")
+        elif rp and not st.session_state.get("new_user_created"):
+            st.error("Complete the profile form above before continuing.")
         else:
             payload: dict = {"user_id": uid, "jd_text": jt}
             if rp:
@@ -531,22 +634,35 @@ if not thread_id:
                 "in the sidebar instead."
             )
 
+            _qg_type_labels = {
+                "coverletter":     "📝 Cover Letter",
+                "email":           "📧 HR Email",
+                "outreachmessage": "💬 Outreach Message",
+            }
             _qg_types = st.multiselect(
                 "Documents to generate",
-                ["coverletter", "email", "outreachmessage"],
+                list(_qg_type_labels.keys()),
                 default=["coverletter"],
-                format_func=lambda x: {
-                    "coverletter":     "📝 Cover Letter",
-                    "email":           "📧 HR Email",
-                    "outreachmessage": "💬 Outreach Message",
-                }[x],
+                format_func=lambda x: _qg_type_labels[x],
                 key="welcome_qg_types",
             )
+            _qg_no_jd = st.checkbox(
+                "Cold-outreach mode (no specific JD)",
+                value=False,
+                key="welcome_qg_no_jd",
+                help="Generate without anchoring to a job description.",
+            )
+            _qg_custom = st.text_area(
+                "Custom instructions (optional)", value="", height=68,
+                placeholder="e.g. 'Keep it under 150 words', 'Address Sarah at Acme'…",
+                key="welcome_qg_custom",
+            )
 
-            if not _jd_ready:
-                st.info("Paste a job description in the sidebar to enable generation.")
+            _jd_ready_or_cold = _jd_ready or _qg_no_jd
+            if not _jd_ready_or_cold:
+                st.info("Paste a job description in the sidebar, or enable cold-outreach mode.")
 
-            if st.button("✨ Generate Now", type="primary", use_container_width=True, disabled=not _jd_ready):
+            if st.button("✨ Generate Now", type="primary", use_container_width=True, disabled=not _jd_ready_or_cold):
                 if not _qg_types:
                     st.warning("Select at least one document type.")
                 else:
@@ -555,10 +671,12 @@ if not thread_id:
                             "post",
                             "/edit/quick-generate",
                             json={
-                                "user_id":          st.session_state["user_id"],
-                                "jd_text":          st.session_state["jd_text"],
-                                "resume_id":        st.session_state.get("existing_resume_id"),
-                                "generation_types": _qg_types,
+                                "user_id":            st.session_state["user_id"],
+                                "jd_text":            st.session_state["jd_text"] if not _qg_no_jd else None,
+                                "resume_id":          st.session_state.get("existing_resume_id"),
+                                "generation_types":   _qg_types,
+                                "custom_instruction": _qg_custom.strip() or None,
+                                "no_jd":              _qg_no_jd,
                             },
                         )
                     if err:
@@ -684,16 +802,28 @@ if interrupt and interrupt.get("type") == "item_selection":
             "using the checked sections above — no full editing session needed."
         )
 
+        _is_type_labels = {
+            "coverletter":     "📝 Cover Letter",
+            "email":           "📧 HR Email",
+            "outreachmessage": "💬 Outreach Message",
+        }
         _is_qg_types = st.multiselect(
             "Documents to generate",
-            ["coverletter", "email", "outreachmessage"],
+            list(_is_type_labels.keys()),
             default=["coverletter"],
-            format_func=lambda x: {
-                "coverletter":     "📝 Cover Letter",
-                "email":           "📧 HR Email",
-                "outreachmessage": "💬 Outreach Message",
-            }[x],
+            format_func=lambda x: _is_type_labels[x],
             key="is_qg_types",
+        )
+        _is_no_jd = st.checkbox(
+            "Cold-outreach mode (no specific JD)",
+            value=False,
+            key="is_qg_no_jd",
+            help="Generate without anchoring to a job description.",
+        )
+        _is_custom = st.text_area(
+            "Custom instructions (optional)", value="", height=68,
+            placeholder="e.g. 'Keep it under 150 words', 'Address Sarah at Acme'…",
+            key="is_qg_custom",
         )
 
         if st.button("✨ Generate Now", type="primary", key="is_qg_btn"):
@@ -707,8 +837,10 @@ if interrupt and interrupt.get("type") == "item_selection":
                         "post",
                         f"/edit/{thread_id}/generate-from-items",
                         json={
-                            "generation_types": _is_qg_types,
-                            "selected_items":   selected,
+                            "generation_types":   _is_qg_types,
+                            "selected_items":     selected,
+                            "custom_instruction": _is_custom.strip() or None,
+                            "no_jd":              _is_no_jd,
                         },
                     )
                 if err:
@@ -1013,18 +1145,24 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
 
         latex = st.session_state.get("preview_latex", "")
         if latex:
+            _fname = st.text_input(
+                "File name", value=_default_filename("tex"),
+                key="dl_fname_preview",
+                help="Change the file name before downloading",
+            )
+            _base = _fname.rsplit(".", 1)[0] if "." in _fname else _fname
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 st.download_button(
                     "⬇️ Download .tex", data=latex,
-                    file_name="tailored_resume.tex", mime="text/plain",
+                    file_name=f"{_base}.tex", mime="text/plain",
                 )
             with col_dl2:
                 pdf_bytes = try_compile_latex(latex)
                 if pdf_bytes:
                     st.download_button(
                         "⬇️ Download .pdf", data=pdf_bytes,
-                        file_name="tailored_resume.pdf", mime="application/pdf",
+                        file_name=f"{_base}.pdf", mime="application/pdf",
                     )
             png = latex_to_png(latex)
             if png:
@@ -1042,9 +1180,9 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
         )
         st.divider()
 
-        # ── Initialise custom order from default on first visit ────────────
+        # ── Initialise custom order from present sections on first visit ──────
         if st.session_state["custom_section_order"] is None:
-            st.session_state["custom_section_order"] = _DEFAULT_SECTION_ORDER.copy()
+            st.session_state["custom_section_order"] = _present_sections()
 
         _order = st.session_state["custom_section_order"]
 
@@ -1064,7 +1202,7 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
                 st.rerun()
 
         if st.button("↺ Reset order", key="lo_reset_order"):
-            st.session_state["custom_section_order"] = _DEFAULT_SECTION_ORDER.copy()
+            st.session_state["custom_section_order"] = _present_sections()
             st.rerun()
 
         st.divider()
@@ -1114,11 +1252,17 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
 
         _lo_latex = st.session_state.get("custom_preview_latex", "")
         if _lo_latex:
+            _lo_fname = st.text_input(
+                "File name", value=_default_filename("tex"),
+                key="dl_fname_layout",
+                help="Change the file name before downloading",
+            )
+            _lo_base = _lo_fname.rsplit(".", 1)[0] if "." in _lo_fname else _lo_fname
             _lo_dl_col1, _lo_dl_col2 = st.columns(2)
             with _lo_dl_col1:
                 st.download_button(
                     "⬇️ Download .tex", data=_lo_latex,
-                    file_name="tailored_resume_custom.tex", mime="text/plain",
+                    file_name=f"{_lo_base}.tex", mime="text/plain",
                     key="lo_dl_tex",
                 )
             with _lo_dl_col2:
@@ -1126,7 +1270,7 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
                 if _lo_pdf:
                     st.download_button(
                         "⬇️ Download .pdf", data=_lo_pdf,
-                        file_name="tailored_resume_custom.pdf", mime="application/pdf",
+                        file_name=f"{_lo_base}.pdf", mime="application/pdf",
                         key="lo_dl_pdf",
                     )
             _lo_png = latex_to_png(_lo_latex)
@@ -1185,15 +1329,21 @@ elif not interrupt and thread_id:
 
         with col_dl:
             if latex:
+                _done_fname = st.text_input(
+                    "File name", value=_default_filename("tex"),
+                    key="dl_fname_done",
+                    help="Change the file name before downloading",
+                )
+                _done_base = _done_fname.rsplit(".", 1)[0] if "." in _done_fname else _done_fname
                 st.download_button(
                     "⬇️ Download .tex", data=latex,
-                    file_name="tailored_resume.tex", mime="text/plain",
+                    file_name=f"{_done_base}.tex", mime="text/plain",
                 )
                 pdf_bytes = try_compile_latex(latex)
                 if pdf_bytes:
                     st.download_button(
                         "⬇️ Download .pdf", data=pdf_bytes,
-                        file_name="tailored_resume.pdf", mime="application/pdf",
+                        file_name=f"{_done_base}.pdf", mime="application/pdf",
                     )
 
         if latex:

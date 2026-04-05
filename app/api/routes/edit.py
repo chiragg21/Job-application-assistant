@@ -93,7 +93,9 @@ class ScoreResponse(BaseModel):
 
 
 class SessionGenerateRequest(BaseModel):
-    generation_types: list[str]   # ["coverletter", "email", "outreachmessage"]
+    generation_types:   list[str]         # ["coverletter", "email", "outreachmessage"]
+    custom_instruction: str | None = None
+    no_jd:              bool       = False
 
 
 class SessionGenerateResponse(BaseModel):
@@ -102,12 +104,14 @@ class SessionGenerateResponse(BaseModel):
 
 
 class QuickGenerateRequest(BaseModel):
-    user_id:          int
-    jd_text:          str
-    generation_types: list[str]   # ["coverletter", "email", "outreachmessage"]
+    user_id:            int
+    jd_text:            str | None = None  # required when no_jd=False; ignored when no_jd=True
+    generation_types:   list[str]          # ["coverletter", "email", "outreachmessage"]
     # resume_id is optional: if supplied it is used for personal info; otherwise
     # the most-recent resume for user_id is used automatically.
-    resume_id:        int | None = None
+    resume_id:          int | None = None
+    custom_instruction: str | None = None
+    no_jd:              bool       = False
 
 
 class QuickGenerateResponse(BaseModel):
@@ -117,8 +121,10 @@ class QuickGenerateResponse(BaseModel):
 
 
 class GenerateFromItemsRequest(BaseModel):
-    generation_types: list[str]
-    selected_items:   list[dict] | None = None  # None → use all ranked_items from state
+    generation_types:   list[str]
+    selected_items:     list[dict] | None = None  # None → use all ranked_items from state
+    custom_instruction: str | None = None
+    no_jd:              bool       = False
 
 
 # ======================================================================
@@ -316,7 +322,9 @@ def generate_from_session(thread_id: str, req: SessionGenerateRequest):
         for gen_type in req.generation_types:
             try:
                 results[gen_type] = generate_fn(
-                    resume=tailored_resume, jd=parsed_jd, type=gen_type
+                    resume=tailored_resume, jd=parsed_jd, type=gen_type,
+                    custom_instruction=req.custom_instruction,
+                    no_jd=req.no_jd,
                 )
             except Exception as exc:
                 errors.append(f"{gen_type}: {exc}")
@@ -373,7 +381,11 @@ def generate_from_items(thread_id: str, req: GenerateFromItemsRequest):
         errors:  list = []
         for gen_type in req.generation_types:
             try:
-                results[gen_type] = _generate_fn(resume=tailored, jd=parsed_jd, type=gen_type)
+                results[gen_type] = _generate_fn(
+                    resume=tailored, jd=parsed_jd, type=gen_type,
+                    custom_instruction=req.custom_instruction,
+                    no_jd=req.no_jd,
+                )
             except Exception as exc:
                 errors.append(f"{gen_type}: {exc}")
 
@@ -407,9 +419,41 @@ def quick_generate(req: QuickGenerateRequest):
     from app.agents.generator_agent import generate as generate_fn
 
     try:
-        # ── Parse JD + load personal info in parallel ──────────────────
+        # ── Cold-outreach mode: no JD required ─────────────────────────
+        if req.no_jd:
+            if req.resume_id is not None:
+                _, parsed_resume = pl.load_resume_from_db(req.resume_id)
+            else:
+                _, parsed_resume = pl.load_latest_resume_for_user(req.user_id)
+
+            results: dict = {}
+            errors:  list = []
+            for gen_type in req.generation_types:
+                try:
+                    results[gen_type] = generate_fn(
+                        resume=parsed_resume, jd=None, type=gen_type,
+                        custom_instruction=req.custom_instruction,
+                        no_jd=True,
+                    )
+                except Exception as exc:
+                    errors.append(f"{gen_type}: {exc}")
+
+            return QuickGenerateResponse(
+                results=results,
+                parsed_jd=None,
+                errors="; ".join(errors) if errors else None,
+            )
+
+        # ── Normal mode: parse JD + retrieve best sections ─────────────
+        jd_text = (req.jd_text or "").strip()
+        if not jd_text:
+            raise HTTPException(
+                status_code=422,
+                detail="jd_text is required when no_jd is False.",
+            )
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            jd_fut  = pool.submit(pl.parse_jd, req.jd_text, req.user_id)
+            jd_fut  = pool.submit(pl.parse_jd, jd_text, req.user_id)
             if req.resume_id is not None:
                 res_fut = pool.submit(pl.load_resume_from_db, req.resume_id)
             else:
@@ -438,7 +482,9 @@ def quick_generate(req: QuickGenerateRequest):
         for gen_type in req.generation_types:
             try:
                 results[gen_type] = generate_fn(
-                    resume=tailored, jd=parsed_jd, type=gen_type
+                    resume=tailored, jd=parsed_jd, type=gen_type,
+                    custom_instruction=req.custom_instruction,
+                    no_jd=False,
                 )
             except Exception as exc:
                 errors.append(f"{gen_type}: {exc}")

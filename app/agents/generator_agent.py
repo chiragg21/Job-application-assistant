@@ -15,27 +15,25 @@ _TRUTHFULNESS_GUARDRAIL = """
 - Maintain a realistic and honest tone.
 """
 
+_NO_JD_NOTE = (
+    "No specific job description was provided. "
+    "Write for a general cold-outreach context — highlight the candidate's "
+    "strongest skills and experience without anchoring to a particular role."
+)
+
 
 def render_email(email: Union[Email, dict]) -> str:
     if isinstance(email, dict):
         email = Email(**email)
 
     lines = []
-
-    # Subject
     lines.append(f"Subject: {email.subject}")
     lines.append("")
-
-    # Greeting
     lines.append(email.greeting)
     lines.append("")
-
-    # Body paragraphs
     for para in email.body:
         lines.append(para.strip())
         lines.append("")
-
-    # Closing
     lines.append(email.closing)
     lines.append(email.signature)
 
@@ -47,25 +45,15 @@ def render_cover_letter(cl: Union[CoverLetter, dict]) -> str:
         cl = CoverLetter(**cl)
 
     parts = []
-
-    # Greeting
     parts.append(cl.greeting)
     parts.append("")
-
-    # Opening
     parts.append(cl.opening_paragraph.strip())
     parts.append("")
-
-    # Body paragraphs
     for para in cl.body_paragraphs:
         parts.append(para.strip())
         parts.append("")
-
-    # Closing paragraph
     parts.append(cl.closing_paragraph.strip())
     parts.append("")
-
-    # Sign-off
     parts.append(cl.closing)
     parts.append(cl.signature)
 
@@ -75,38 +63,59 @@ def render_cover_letter(cl: Union[CoverLetter, dict]) -> str:
 def render_outreach_message(msg: Union[OutreachMessage, dict]) -> str:
     if isinstance(msg, dict):
         msg = OutreachMessage(**msg)
-
     return msg.full_message.strip()
 
 
-def generate_cover_letter_prompt(job_description, resume_content):
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
+
+def _custom_instruction_block(custom_instruction: str | None) -> str:
+    if custom_instruction and custom_instruction.strip():
+        return f"""
+### CUSTOM INSTRUCTIONS (follow carefully):
+{custom_instruction.strip()}
+"""
+    return ""
+
+
+def generate_cover_letter_prompt(
+    job_description,
+    resume_content,
+    custom_instruction: str | None = None,
+    no_jd: bool = False,
+):
+    jd_note = _NO_JD_NOTE if no_jd else ""
+
     system_prompt = f"""
 You are an expert career coach and professional resume writer.
 
-Your task is to generate a tailored, compelling cover letter using the provided job description and candidate resume.
+Your task is to generate a tailored, compelling cover letter using the provided
+{"candidate information" if no_jd else "job description and candidate resume"}.
 
 ### Instructions:
-- Personalize the letter specifically for the role and company (avoid generic language).
-- Highlight the candidate's most relevant achievements and skills that match the job description.
-- Focus on impact, results, and alignment with the role.
+- {"Write for a general cold-outreach context — do not assume a specific role." if no_jd else "Personalize the letter specifically for the role and company (avoid generic language)."}
+- Highlight the candidate's most relevant achievements and skills{"." if no_jd else " that match the job description."}
+- Focus on impact, results, and alignment{"." if no_jd else " with the role."}
 - Maintain a confident but professional tone.
 - Avoid repeating the resume verbatim — synthesize and reframe it.
 - Keep it concise (300-400 words).
 - Don't try to add every information present on candidate, use only those which are relevant.
 
+{jd_note}
+
 ---
 
 {_TRUTHFULNESS_GUARDRAIL}
 
----
-
+{_custom_instruction_block(custom_instruction)}
 """
 
-    prompt = f""""
-        Generate Cover Letter for the below given, job description, resume content, and strictly follow the output schema.
+    prompt = f"""
+Generate a Cover Letter for the candidate below and strictly follow the output schema.
 
-### Job Description:
-{job_description}
+{"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
+{"{}" if no_jd else str(job_description)}
 
 ---
 
@@ -120,13 +129,18 @@ Your task is to generate a tailored, compelling cover letter using the provided 
 Return JSON matching this schema:
 
 {CoverLetter.model_json_schema()}
-
-    """
-
+"""
     return system_prompt, prompt
 
 
-def generate_outreach_message_prompt(job_description, resume_content):
+def generate_outreach_message_prompt(
+    job_description,
+    resume_content,
+    custom_instruction: str | None = None,
+    no_jd: bool = False,
+):
+    jd_note = _NO_JD_NOTE if no_jd else ""
+
     system_prompt = f"""
 You are an experienced career coach helping candidates write high-response outreach messages.
 
@@ -136,25 +150,28 @@ Your task is to generate a concise, personalized outreach message to a recruiter
 - Keep it short (4-6 sentences max).
 - Friendly, confident, and natural tone (not overly formal).
 - Mention:
-- Who the candidate is (1 line intro)
-- Key strength relevant to the role
-- Alignment with the job description
-- A polite call-to-action (e.g., open to connecting or referral)
+  - Who the candidate is (1 line intro)
+  - Key strength{"" if no_jd else " relevant to the role"}
+  - {"General value proposition" if no_jd else "Alignment with the job description"}
+  - A polite call-to-action (e.g., open to connecting or referral)
 - Avoid buzzwords and generic phrasing.
 - Optimize for LinkedIn or cold outreach.
 - Don't try to add every information present on candidate, use only those which are relevant.
+
+{jd_note}
+
 ---
 
 {_TRUTHFULNESS_GUARDRAIL}
 
+{_custom_instruction_block(custom_instruction)}
 """
 
-    prompt = f""""
-Generate Outreach Letter for the below given, job description, resume content, and strictly follow the output schema.
+    prompt = f"""
+Generate an Outreach Message for the candidate below and strictly follow the output schema.
 
-
-### Job Description:
-{job_description}
+{"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
+{"{}" if no_jd else str(job_description)}
 
 ---
 
@@ -168,12 +185,18 @@ Generate Outreach Letter for the below given, job description, resume content, a
 Return JSON matching this schema:
 
 {OutreachMessage.model_json_schema()}
-
-    """
+"""
     return system_prompt, prompt
 
 
-def generate_email_prompt(job_description, resume_content):
+def generate_email_prompt(
+    job_description,
+    resume_content,
+    custom_instruction: str | None = None,
+    no_jd: bool = False,
+):
+    jd_note = _NO_JD_NOTE if no_jd else ""
+
     system_prompt = f"""
 You are an expert career coach helping candidates write professional job outreach emails.
 
@@ -193,51 +216,71 @@ Rules:
 - No extra keys
 - No explanation text
 
+{jd_note}
+
 {_TRUTHFULNESS_GUARDRAIL}
 
+{_custom_instruction_block(custom_instruction)}
 """
+
     prompt = f"""
-    Generate Email for the below given, job description, resume content, and strictly follow the output schema.
+Generate an Email for the candidate below and strictly follow the output schema.
 
-    ---
+{"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
+{"{}" if no_jd else str(job_description)}
 
-    ### Job Description:
-    {job_description}
+---
 
-    ---
+### Candidate Resume:
+{resume_content}
 
-    ### Candidate Resume:
-    {resume_content}
+---
 
-    ---
+### OUTPUT FORMAT (STRICT JSON)
 
-    ### OUTPUT FORMAT (STRICT JSON)
+Return JSON matching this schema exactly:
 
-    Return JSON matching this schema exactly:
-
-    {Email.model_json_schema()}
-    """
+{Email.model_json_schema()}
+"""
     return system_prompt, prompt
 
 
-def generate(resume: ParsedResume, jd: ParsedJD, type: str):
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def generate(
+    resume: ParsedResume,
+    jd: ParsedJD | None,
+    type: str,
+    custom_instruction: str | None = None,
+    no_jd: bool = False,
+):
     resume_dict = {key: resume.model_dump()[key] for key in ["personal_info", "resume_sections"]}
-    jd_dict = jd.model_dump()
+    jd_dict     = jd.model_dump() if jd and not no_jd else {}
 
     action_map = {
-        "coverletter": (generate_cover_letter_prompt, CoverLetter, render_cover_letter),
-        "outreachmessage": (generate_outreach_message_prompt, OutreachMessage, render_outreach_message),
-        "email": (generate_email_prompt, Email, render_email),
+        "coverletter":     (generate_cover_letter_prompt,    CoverLetter,      render_cover_letter),
+        "outreachmessage": (generate_outreach_message_prompt, OutreachMessage,  render_outreach_message),
+        "email":           (generate_email_prompt,            Email,            render_email),
     }
 
     type = type.lower().replace("_", "")
-    if type in action_map:
-        action, model, render = action_map[type]
-        system_prompt, prompt = action(resume_dict, jd_dict)
-    else:
-        raise Exception
+    if type not in action_map:
+        raise ValueError(f"Unknown generation type: '{type}'")
 
-    response = _llm.generate(Prompt(system=system_prompt, user=prompt), provider="gemini", response_model=model)
+    action, model, render = action_map[type]
+    system_prompt, prompt = action(
+        jd_dict, resume_dict,
+        custom_instruction=custom_instruction,
+        no_jd=no_jd,
+    )
+
+    response = _llm.generate(
+        Prompt(system=system_prompt, user=prompt),
+        provider="gemini",
+        response_model=model,
+    )
     if not response.schema_matched or response.parsed is None:
         raise ValueError(f"LLM response did not match {model.__name__} schema")
 
