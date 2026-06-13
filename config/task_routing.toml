@@ -62,3 +62,11 @@ model    = "llama-3.3-70b-versatile"
 [tasks.generation.fallback]
 provider = "gemini"
 model    = "gemini-2.5-flash-lite"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tasks.resume_parsing]
+# LLM fallback parser for non-LaTeX resumes (PDF, DOCX) or unknown LaTeX templates.
+# Called once per resume upload when the regex fast-path fails.
+provider = "gemini"
+model    = "gemini-2.5-flash"

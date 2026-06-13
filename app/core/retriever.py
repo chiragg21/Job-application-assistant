@@ -74,25 +74,29 @@ class ResumeRetriever:
         chroma_result:      dict,
         n_responsibilities: int,
         top_k:              int,
+        return_all:         bool = False,
     ) -> list[tuple[float, str, dict]]:
         """
         Two-stage fusion:
         Stage 1 — CombMNZ within each group (required, resp, nice_to_have)
                     group_score = sum(similarities) * n_appearances
-        Stage 2 — Weighted CombSUM across groups
-                    fused_score = sum(WEIGHT[g] * group_score[g])
+                    Then normalize each group to [0, 1] so group sizes don't
+                    inflate scores (a JD with 10 responsibilities no longer
+                    dominates one with 2).
+        Stage 2 — Weighted CombSUM across groups → final score in [0, 1]
+                    fused = w_skill*norm_req + w_resp*norm_resp + w_nice*norm_nice
+                    Divided by sum(weights) so the result stays in [0, 1]
+                    regardless of how the weights are configured.
 
         CombMNZ within responsibilities rewards docs matching multiple
-        responsibilities. Weighted CombSUM across groups ensures required_skills
-        outweighs the entire responsibilities group regardless of its size.
+        responsibilities. Normalization + weighted CombSUM ensures required_skills
+        outweighs the entire responsibilities group regardless of its size, while
+        keeping final scores in [0, 1] for direct UI display.
         """
         idx_required   = 0
         idx_resp_start = 1
         idx_resp_end   = 1 + n_responsibilities
 
-        # Stage 1 accumulators per group
-        # sim_sum[group][cid]    = sum of similarities across queries in that group
-        # appearances[group][cid]= number of query results the doc appeared in
         sim_sum:     dict[str, dict[str, float]] = {"required": {}, "resp": {}, "nice": {}}
         appearances: dict[str, dict[str, int]]   = {"required": {}, "resp": {}, "nice": {}}
         meta_store:  dict[str, dict]             = {}
@@ -113,38 +117,43 @@ class ResumeRetriever:
 
             for cid, dist, meta in zip(id_row, dist_row, meta_row):
                 sim = 1.0 - dist
-                sim_sum[group][cid]      = sim_sum[group].get(cid, 0.0) + sim
-                appearances[group][cid]  = appearances[group].get(cid, 0) + 1
+                sim_sum[group][cid]     = sim_sum[group].get(cid, 0.0) + sim
+                appearances[group][cid] = appearances[group].get(cid, 0) + 1
                 if cid not in meta_store:
                     meta_store[cid] = meta
 
-        # Stage 1 — CombMNZ score per group per doc
-        # combmnz[group][cid] = sim_sum * appearances
+        # Stage 1 — CombMNZ per group, then normalize to [0, 1]
         combmnz: dict[str, dict[str, float]] = {"required": {}, "resp": {}, "nice": {}}
         for group in ("required", "resp", "nice"):
-            for cid in sim_sum[group]:
-                combmnz[group][cid] = sim_sum[group][cid] * appearances[group][cid]
+            raw = {cid: sim_sum[group][cid] * appearances[group][cid]
+                   for cid in sim_sum[group]}
+            max_val = max(raw.values()) if raw else 1.0
+            combmnz[group] = {cid: v / max_val for cid, v in raw.items()}
 
-        # Stage 2 — weighted CombSUM across groups
+        # Stage 2 — weighted CombSUM, result normalised to [0, 1]
+        weight_total = self.weight_skill + self.weight_resp + self.weight_nth
         all_ids = set(combmnz["required"]) | set(combmnz["resp"]) | set(combmnz["nice"])
-        fused: dict[str, float] = {}
-
-        for cid in all_ids:
-            fused[cid] = (
+        fused: dict[str, float] = {
+            cid: (
                 self.weight_skill * combmnz["required"].get(cid, 0.0)
-                + self.weight_resp  * combmnz["resp"].get(cid, 0.0)
-                + self.weight_nth    * combmnz["nice"].get(cid, 0.0)
-            )
+                + self.weight_resp * combmnz["resp"].get(cid, 0.0)
+                + self.weight_nth  * combmnz["nice"].get(cid, 0.0)
+            ) / weight_total
+            for cid in all_ids
+        }
 
         ranked = sorted(
             [(score, cid, meta_store[cid]) for cid, score in fused.items()],
             key=lambda x: x[0],
             reverse=True,
-        )[:top_k]
+        )
+
+        if not return_all:
+            ranked = ranked[:top_k]
 
         log.info(
-            "_rerank | n_resp=%d candidates=%d top_k=%d returned=%d",
-            n_responsibilities, len(fused), top_k, len(ranked),
+            "_rerank | n_resp=%d candidates=%d top_k=%d returned=%d return_all=%s",
+            n_responsibilities, len(fused), top_k, len(ranked), return_all,
         )
         return ranked
     
@@ -153,32 +162,12 @@ class ResumeRetriever:
         raw:                dict | Any,
         n_responsibilities: int,
         top_k:              int,
+        return_all:         bool = False,
     ) -> list[tuple[float, str, dict]]:
-        """
-        Validates raw ChromaDB result then calls _rerank.
-        Returns empty list if ChromaDB returned nothing.
-
-        Parameters
-        ----------
-        raw                : direct return value of col_resume.query()
-        n_responsibilities : len(jd_obj.responsibilities)
-        top_k              : final number of results wanted
-
-        Returns
-        -------
-        list of (fused_score, chroma_id, metadata) sorted desc, length <= top_k
-
-        Example
-        -------
-            raw    = self.col_resume.query(...)
-            ranked = _apply_rerank(raw, n_responsibilities=5, top_k=TOP_K)
-            for score, cid, meta in ranked:
-                sql_id = meta.get("sql_id")
-        """
         if not raw or not raw.get("ids") or not any(raw["ids"]):
             log.warning("_apply_rerank received empty ChromaDB result")
             return []
-        return self._rerank(raw, n_responsibilities, top_k)
+        return self._rerank(raw, n_responsibilities, top_k, return_all=return_all)
         
     # ------------------------------------------------------------------
     # Internal: build the ChromaDB `where` clause from section/item/resume filters
@@ -213,36 +202,42 @@ class ResumeRetriever:
         section_name: str,
         item_name:    str | None = None,
         resume_ids:   list[int] | None = None,
+        return_all:   bool = False,
     ):
         where = self._build_where(section_name, item_name, resume_ids)
+        n_results = self.fetch_mult * self.top_k
         res = self.col_resume.query(
             query_texts=text,
-            n_results=self.fetch_mult * self.top_k,
+            n_results=n_results,
             where=where,
             include=["metadatas", "distances"],
         )
-        return self._apply_rerank(res, self._n_resp, TOP_K)
+        return self._apply_rerank(res, self._n_resp, TOP_K, return_all=return_all)
 
-    def retrieve(self, text: list[str], resume_ids: list[int] | None = None):
+    def retrieve(
+        self,
+        text:       list[str],
+        resume_ids: list[int] | None = None,
+        return_all: bool = False,
+    ):
         """
-        Retrieve top-k sections for all flat + atomic section types.
+        Retrieve sections for all flat + atomic section types.
 
         resume_ids — when supplied, ChromaDB queries are scoped to only those
-        resume IDs so that only one user's content is considered.  The SQL
-        item-name enumeration is also scoped to those resumes so that items
-        from other users don't appear in the results.
+        resume IDs so that only one user's content is considered.
+        return_all — when True, skip top_k cutoff so every scored candidate is
+        returned (used for item-selection UI where user picks what to include).
         """
         results = []
 
         for flat_sec in FLAT_SECTIONS:
             results.append((
                 flat_sec, None,
-                self.retrieve_top_results(text, flat_sec, resume_ids=resume_ids),
+                self.retrieve_top_results(text, flat_sec, resume_ids=resume_ids, return_all=return_all),
             ))
 
         for atom_sec in ATOMIC_SECTIONS:
             if resume_ids:
-                # Filter item_name enumeration to the user's resumes via a SQL JOIN
                 placeholders = ",".join(str(rid) for rid in resume_ids)
                 raw = self.db.execute_raw(
                     f"""
@@ -251,27 +246,34 @@ class ResumeRetriever:
                     JOIN   resume_sections rs ON rsi.section_id = rs.id
                     WHERE  rsi.section_name = :sec
                       AND  rs.resume_id IN ({placeholders})
+                      AND  rsi.is_latest = 1
                     """,
                     {"sec": atom_sec},
                 )
                 item_list = [r["item_name"] for r in (raw or []) if r.get("item_name")]
             else:
-                items_df  = self.db.fetch_table_where(
+                items_df = self.db.fetch_table_where(
                     table_name="resume_section_items",
                     columns=["item_name"],
-                    filters={"section_name": atom_sec},
+                    filters={"section_name": atom_sec, "is_latest": 1},
                 )
                 item_list = items_df["item_name"].unique().tolist()
 
             for item in item_list:
                 results.append((
                     atom_sec, item,
-                    self.retrieve_top_results(text, atom_sec, item, resume_ids=resume_ids),
+                    self.retrieve_top_results(text, atom_sec, item, resume_ids=resume_ids, return_all=return_all),
                 ))
 
         return results
 
-    def run(self, job_id, jd_obj: ParsedJD | None, resume_ids: list[int] | None = None):
+    def run(
+        self,
+        job_id,
+        jd_obj:     ParsedJD | None,
+        resume_ids: list[int] | None = None,
+        return_all: bool = False,
+    ):
         if jd_obj is None:
             jd_obj = self._fetch_jd(job_id)
         if not jd_obj:
@@ -284,7 +286,7 @@ class ResumeRetriever:
             + jd_obj.responsibilities
             + [",".join(jd_obj.nice_to_have_skills)]
         )
-        return self.retrieve(text=text, resume_ids=resume_ids)
+        return self.retrieve(text=text, resume_ids=resume_ids, return_all=return_all)
         
     def rank_and_filter(
         self,
@@ -318,14 +320,21 @@ class ResumeRetriever:
             resume_id = meta.get('resume_id')
             sec_name  = meta.get('section_type')
             if item_name:
+                sql_id = meta.get('sql_id')
+                if sql_id:
+                    return self.db.fetch_one(
+                        table_name='resume_section_items',
+                        filters={"id": int(sql_id)},
+                    ) or {}
+                # fallback for legacy entries without sql_id
                 return self.db.fetch_one(
                     table_name='resume_section_items',
-                    filters={"resume_id": resume_id, "section_name": sec_name, "item_name": item_name}
+                    filters={"resume_id": resume_id, "section_name": sec_name, "item_name": item_name, "is_latest": 1},
                 ) or {}
             else:
                 return self.db.fetch_one(
                     table_name='resume_sections',
-                    filters={"resume_id": resume_id, "section_name": sec_name}
+                    filters={"resume_id": resume_id, "section_name": sec_name},
                 ) or {}
 
         flat_output: list[dict] = []
@@ -357,10 +366,12 @@ class ResumeRetriever:
 
             aggregated.sort(key=lambda x: x[1], reverse=True)
 
-            for item_name, _, chunks in aggregated:
+            for item_name, agg, chunks in aggregated:
                 atom_output.append({
                     "section_name": section_name,
                     "item_name":    item_name,
+                    "best_score":   round(chunks[0][0], 4) if chunks else 0.0,
+                    "agg_score":    round(agg, 4),
                     "scores":       [sc for sc, _, _ in chunks],
                     "rows":         [row for _, _, row in chunks],
                 })

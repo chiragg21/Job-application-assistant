@@ -41,6 +41,7 @@ class EditGraphState(TypedDict, total=False):
     # After interrupt the client sends back selected_items.               #
     # ------------------------------------------------------------------ #
     selected_items: list[dict]   # subset of ranked_items chosen by user
+    dropped_items:  list[dict]   # items the user explicitly dropped at any stage
 
     # ------------------------------------------------------------------ #
     # Stage 4 — Edit agent                                                #

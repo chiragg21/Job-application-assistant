@@ -142,6 +142,7 @@ def node_parse_and_retrieve(state: EditGraphState) -> dict:
                 job_id=job_id,
                 parsed_jd=parsed_jd,
                 resume_ids=user_resume_ids if user_resume_ids else None,
+                return_all=True,
             )
             ranked = pl.rank_and_filter(raw_results)
 
@@ -200,16 +201,20 @@ def node_build_edit_state(state: EditGraphState) -> dict:
         cycle_id    = state.get("cycle_id", 1)
         agent       = pl.build_edit_agent(edit_state, parsed_jd, cycle_id)
 
-        # Build the sections_pending queue from the selected items
-        pending: list[dict] = []
-        for entry in state["selected_items"]:
-            pending.append({
-                "section": entry["section_name"],
-                "item":    entry["item_name"],
-            })
+        # Build the sections_pending queue, excluding anything already dropped
+        dropped_set = {
+            (d["section"], d.get("item"))
+            for d in state.get("dropped_items", [])
+        }
+        pending: list[dict] = [
+            {"section": entry["section_name"], "item": entry["item_name"]}
+            for entry in state["selected_items"]
+            if (entry["section_name"], entry["item_name"]) not in dropped_set
+        ]
 
         return {
             "edit_cycle_dict": _serialise_cycle(agent),
+            "dropped_items":   list(state.get("dropped_items", [])),
             "sections_pending": pending,
             "stage": "edit_state_built",
         }
@@ -238,11 +243,16 @@ def node_generate_suggestions(state: EditGraphState) -> dict:
         else:
             pl.generate_suggestions(agent)
 
-        # Always rebuild sections_pending from selected_items so that refine
-        # cycles start the review loop from scratch.
+        # Rebuild sections_pending from selected_items, skipping anything the
+        # user has dropped (dropped_items accumulates across the whole session).
+        dropped_set = {
+            (d["section"], d.get("item"))
+            for d in state.get("dropped_items", [])
+        }
         pending: list[dict] = [
             {"section": entry["section_name"], "item": entry["item_name"]}
             for entry in state.get("selected_items", [])
+            if (entry["section_name"], entry["item_name"]) not in dropped_set
         ]
 
         return {
@@ -374,6 +384,53 @@ def node_apply_edit(state: EditGraphState) -> dict:
             return {
                 "sections_pending":  [prev_section, current_section] + pending,
                 "sections_reviewed": reviewed[:-1],
+                "stage": "edit_applied",
+            }
+
+        # ── drop — remove item from this session entirely ─────────────────
+        if proposal == "drop":
+            sec_name  = review["section"]
+            item_name = review.get("item")
+            agent     = _rebuild_agent(state)
+            cycle     = agent.editing_cycle
+
+            # Clear the section's updated_section so build_preview skips it
+            if item_name:
+                _, obj = cycle.current_state.get_item(sec_name, item_name)
+                if obj:
+                    from app.models.edit import ItemEditState
+                    cleared = ItemEditState(
+                        section_name=sec_name,
+                        item_name=item_name,
+                        section_previous_state=obj.section_previous_state,
+                        lines_to_change=[],
+                        suggested_changes=[],
+                        updated_section="",
+                    )
+                    cur_items = list(getattr(cycle.current_state, sec_name) or [])
+                    new_items = [cleared if (it and it.item_name == item_name) else it for it in cur_items]
+                    new_state = cycle.current_state.model_copy(update={sec_name: new_items})
+                    cycle.push(new_state, action="drop", section_name=sec_name)
+            else:
+                from app.models.edit import SectionEditState
+                obj = cycle.current_state.get_section(sec_name)
+                if obj:
+                    cleared = SectionEditState(
+                        section_name=sec_name,
+                        section_previous_state=obj.section_previous_state,
+                        lines_to_change=[],
+                        suggested_changes=[],
+                        updated_section="",
+                    )
+                    new_state = cycle.current_state.set_section(sec_name, cleared)
+                    cycle.push(new_state, action="drop", section_name=sec_name)
+
+            dropped = list(state.get("dropped_items", []))
+            dropped.append({"section": sec_name, "item": item_name})
+            return {
+                "edit_cycle_dict":   _serialise_cycle(agent),
+                "dropped_items":     dropped,
+                "sections_reviewed": reviewed + [current_section],
                 "stage": "edit_applied",
             }
 

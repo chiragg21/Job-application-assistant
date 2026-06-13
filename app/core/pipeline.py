@@ -183,7 +183,7 @@ def load_resume_from_db(resume_id: int) -> tuple[int, ParsedResume]:
             items = db.execute_raw(
                 "SELECT item_name, role_title, content_latex, content_text, item_index "
                 "FROM resume_section_items "
-                "WHERE section_id = :sid AND is_master = 1 ORDER BY item_index",
+                "WHERE section_id = :sid AND is_latest = 1 ORDER BY item_index",
                 {"sid": int(sec_row["id"])},
             )
             if isinstance(items, list):
@@ -225,18 +225,18 @@ def retrieve(
     w_resp: float | None = retriever_config['weight_resp'],
     w_nth: float | None = retriever_config['weight_nice_to_have'],
     resume_ids: list[int] | None = None,
+    return_all: bool = False,
 ) -> list[tuple[str, str | None, list[tuple[float, str, dict]]]]:
     """Run retriever, return raw .run() output for rank_and_filter.
 
     resume_ids — if supplied, only sections from those resumes are searched.
-    Pass the result of get_user_resume_ids(user_id) to scope retrieval to one
-    user's history while still picking the most JD-relevant version.
-    Results are cached in-memory: same job_id + resume_ids → skip ChromaDB query.
+    return_all — bypass top_k cutoff, return every scored candidate.
+    Results are cached in-memory keyed on (job_id, resume_ids, return_all).
     """
-    cache_key = (job_id, tuple(sorted(resume_ids)) if resume_ids else None)
+    cache_key = (job_id, tuple(sorted(resume_ids)) if resume_ids else None, return_all)
     with _retrieval_cache_lock:
         if cache_key in _retrieval_cache:
-            log.info("retrieve: cache hit job_id=%s resumes=%s", job_id, resume_ids)
+            log.info("retrieve: cache hit job_id=%s resumes=%s return_all=%s", job_id, resume_ids, return_all)
             return _retrieval_cache[cache_key]
 
     r = _get_retriever()
@@ -245,7 +245,7 @@ def retrieve(
     r.weight_skill = w_skills
     r.weight_resp  = w_resp
     r.weight_nth   = w_nth
-    result = r.run(job_id=job_id, jd_obj=parsed_jd, resume_ids=resume_ids)
+    result = r.run(job_id=job_id, jd_obj=parsed_jd, resume_ids=resume_ids, return_all=return_all)
 
     with _retrieval_cache_lock:
         _retrieval_cache[cache_key] = result
@@ -298,7 +298,7 @@ def load_ranked_items_from_resume(resume_id: int) -> list[dict]:
     # Atomic sections — one entry per item from resume_section_items
     for sec_name in ATOMIC_SECTIONS:
         rows = db.execute_raw(
-            "SELECT * FROM resume_section_items WHERE resume_id = :rid AND section_name = :sec ORDER BY item_index",
+            "SELECT * FROM resume_section_items WHERE resume_id = :rid AND section_name = :sec AND is_latest = 1 ORDER BY item_index",
             {"rid": resume_id, "sec": sec_name},
         ) or []
         for row in rows:
@@ -550,6 +550,127 @@ def collapse_edit_state_to_resume(
         personal_info=personal_info,
         resume_sections=sections,
     )
+
+
+# ------------------------------------------------------------------
+# Edit write-back (called at finish_session)
+# ------------------------------------------------------------------
+
+def write_back_edited_items(state_values: dict, agent: EditAgent) -> int:
+    """
+    Persist changed section content from a finished edit session back to the DB.
+
+    Flat sections   → update resume_sections.content_latex in-place + re-embed.
+    Atomic sections → insert a new resume_section_items row (is_latest=1,
+                      parent_item_id=old_id), mark old row is_latest=0, re-embed.
+
+    Returns the number of rows written back.
+    """
+    selected_items: list[dict] = state_values.get("selected_items", [])
+    resume_id = state_values.get("resume_id")
+    if not selected_items:
+        return 0
+
+    current_state = agent.editing_cycle.current_state
+    db = SQLHandler()
+
+    # (section_name, item_name or None) → entry
+    item_map: dict[tuple, dict] = {
+        (e["section_name"], e.get("item_name")): e
+        for e in selected_items
+    }
+
+    # Get personal info for ChromaDB base metadata
+    parsed_resume_raw = state_values.get("parsed_resume") or {}
+    personal_raw = parsed_resume_raw.get("personal_info") or {}
+    base_meta: dict = {
+        "resume_id": resume_id or 0,
+        "user_name": personal_raw.get("name", ""),
+        "email":     personal_raw.get("email", ""),
+    }
+
+    col_resume = _get_retriever().col_resume
+    written = 0
+
+    # ── Flat sections: update in-place ───────────────────────────────────────
+    for sec_name in FLAT_SECTIONS:
+        entry = item_map.get((sec_name, None))
+        if not entry:
+            continue
+        sec_state = getattr(current_state, sec_name, None)
+        if not sec_state:
+            continue
+        orig_row    = (entry.get("rows") or [{}])[0]
+        orig_id     = orig_row.get("id")
+        new_content = sec_state.updated_section or ""
+        orig_content = orig_row.get("content_latex", "") or ""
+        if not orig_id or new_content == orig_content:
+            continue
+
+        db.update_data(
+            "resume_sections",
+            {"id": orig_id},
+            {"content_latex": new_content, "content_text": new_content},
+        )
+        try:
+            col_resume.upsert(
+                documents=[new_content],
+                metadatas=[{**base_meta, "section_type": sec_name}],
+                ids=[f"res{resume_id}_{sec_name}"],
+            )
+        except Exception as exc:
+            log.warning("[writeback] chroma flat sync failed %s: %s", sec_name, exc)
+        written += 1
+
+    # ── Atomic sections: versioned insert ────────────────────────────────────
+    for sec_name in ATOMIC_SECTIONS:
+        items_state = getattr(current_state, sec_name, None) or []
+        for item_state in items_state:
+            entry = item_map.get((sec_name, item_state.item_name))
+            if not entry:
+                continue
+            orig_row    = (entry.get("rows") or [{}])[0]
+            orig_id     = orig_row.get("id")
+            new_content = item_state.updated_section or ""
+            orig_content = orig_row.get("content_latex", "") or ""
+            if not orig_id or new_content == orig_content:
+                continue
+
+            new_id = db.add_one("resume_section_items", {
+                "resume_id":      orig_row.get("resume_id"),
+                "section_id":     orig_row.get("section_id"),
+                "section_name":   sec_name,
+                "item_name":      item_state.item_name,
+                "role_title":     orig_row.get("role_title") or "",
+                "content_latex":  new_content,
+                "content_text":   new_content,
+                "item_index":     orig_row.get("item_index", 0),
+                "is_master":      0,
+                "is_latest":      1,
+                "parent_item_id": orig_id,
+            })
+            db.update_data("resume_section_items", {"id": orig_id}, {"is_latest": 0})
+
+            try:
+                col_resume.upsert(
+                    documents=[new_content],
+                    metadatas=[{
+                        **base_meta,
+                        "section_type": sec_name,
+                        "sql_table":    "resume_section_items",
+                        "sql_id":       new_id,
+                        "item_name":    item_state.item_name or "",
+                        "role_title":   orig_row.get("role_title") or "",
+                    }],
+                    ids=[f"sec_item_{new_id}"],
+                )
+            except Exception as exc:
+                log.warning("[writeback] chroma atomic sync failed %s/%s: %s",
+                            sec_name, item_state.item_name, exc)
+            written += 1
+
+    log.info("[writeback] resume_id=%s items written back=%d", resume_id, written)
+    return written
 
 
 # ------------------------------------------------------------------

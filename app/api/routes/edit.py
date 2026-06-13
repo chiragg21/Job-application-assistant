@@ -664,8 +664,9 @@ def finish_session(
     except Exception:
         raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
 
-    # Build final LaTeX if edit state is available
+    # Build final LaTeX and write back edited items if edit state is available
     final_latex: str | None = None
+    agent = None
     if state_values.get("edit_cycle_dict"):
         try:
             agent      = _rebuild_agent(state_values)
@@ -678,9 +679,16 @@ def finish_session(
         except Exception as exc:
             log.warning("[edit] could not build final LaTeX at finish: %s", exc)
 
+        if agent is not None:
+            try:
+                pl.write_back_edited_items(state_values, agent)
+            except Exception as exc:
+                log.warning("[edit] write-back failed (non-fatal): %s", exc)
+
     # Persist to DB
     session_id: int | None = None
     docs_saved = 0
+    resume_id = state_values.get("resume_id")
     try:
         db     = SQLHandler()
         job_id = state_values.get("job_id")
@@ -692,6 +700,11 @@ def finish_session(
         row = db.get_edit_session_by_thread(thread_id)
         if row:
             session_id = row["id"]
+            if resume_id:
+                db.execute_raw(
+                    "UPDATE edit_sessions SET input_resume_id = :rid, output_resume_id = :rid WHERE id = :sid",
+                    {"rid": resume_id, "sid": session_id},
+                )
             if documents and session_id:
                 db.save_session_documents(session_id, documents)
                 docs_saved = len(documents)

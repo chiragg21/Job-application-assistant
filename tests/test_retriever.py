@@ -302,6 +302,7 @@ class TestRunRetriever:
 
         result = retriever.run_retriever(job_id=1, jd_obj=sample_jd)
 
-        retriever.run.assert_called_once_with(1, sample_jd)
+        args, kwargs = retriever.run.call_args
+        assert args[:2] == (1, sample_jd)
         retriever.rank_and_filter.assert_called_once()
         assert result == [{"section_name": "skills"}]

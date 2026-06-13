@@ -1,0 +1,38 @@
+\documentclass[{{ font_size }}pt,a4paper]{article}
+\usepackage[a4paper,margin={{ margin }}in]{geometry}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{fontawesome}
+\usepackage{xcolor}
+\usepackage{parskip}
+
+\hypersetup{colorlinks=true, urlcolor=blue}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\titleformat{\section}{\bfseries\large}{}{0em}{}[\titlerule]
+\setlist[itemize]{leftmargin=1.5em, itemsep=2pt, topsep=2pt}
+
+\pagestyle{empty}
+\begin{document}
+
+%---------------------- HEADER ----------------------%
+\begin{center}
+    {\Huge \textbf{{{ personal.name }}}}\\
+    \vspace{1mm}
+    \faEnvelope~\href{mailto:{{ personal.email }}}{{{ personal.email }}} \quad
+    \faPhone~{{ personal.phone }} \quad
+    \faGithub~\href{{{ personal.github }}}{{{ personal.github_handle }}} \quad
+    \faLinkedin~\href{{{ personal.linkedin }}}{{{ personal.linkedin_name }}}
+\end{center}
+
+{% for section in sections %}{% if section.content %}\vspace{{ '{' }}{{ section_space }}mm{{ '}' }}
+\section{{{ section.heading }}}
+{{ section.content }}
+{% elif section.items %}\vspace{{ '{' }}{{ section_space }}mm{{ '}' }}
+\section{{{ section.heading }}}
+{% for i, item in section.items|enumerate %}{% if i > 0 %}\vspace{{ '{' }}{{ subsection_space }}mm{{ '}' }}
+{% endif %}{{ item }}
+{% endfor %}{% endif %}{% endfor %}
+\end{document}

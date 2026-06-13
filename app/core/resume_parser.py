@@ -1,7 +1,9 @@
+import json
 import os
 import re
 from typing import List, Tuple, Optional
 from pathlib import Path
+from pydantic import BaseModel, Field
 from app.utils import SQLHandler, get_logger
 from app.models.resume import (
     PersonalInfo, ResumeSection, ParsedResume,
@@ -19,6 +21,33 @@ if _HF_TOKEN:
     os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _HF_TOKEN)
 
 log = get_logger(__name__)
+
+
+# ── LLM output schema for the fallback parser ─────────────────────────────────
+
+class _LLMAtomicItem(BaseModel):
+    name: Optional[str] = Field(None, description="Company or project name")
+    role: Optional[str] = Field(None, description="Job title or role (experience only)")
+    content: str        = Field("",   description="Full plain-text content of this block")
+
+class _LLMSection(BaseModel):
+    type: str = Field(..., description=(
+        "One of: experience, projects, education, skills, achievements, relevant_coursework"
+    ))
+    items:   List[_LLMAtomicItem] = Field(default_factory=list, description=(
+        "For experience and projects: one entry per company / project block"
+    ))
+    content: str = Field("", description=(
+        "For education, skills, achievements, relevant_coursework: full section text"
+    ))
+
+class _LLMResumeOutput(BaseModel):
+    name:     str = Field("", description="Full name")
+    email:    str = Field("", description="Email address")
+    phone:    str = Field("", description="Phone number")
+    github:   str = Field("", description="GitHub profile URL (if present)")
+    linkedin: str = Field("", description="LinkedIn profile URL (if present)")
+    sections: List[_LLMSection] = Field(default_factory=list)
 
 SECTION_MAPPING = {
     "experience": ["experience", "work experience", "professional experience", "employment", "working experience"],
@@ -230,6 +259,132 @@ class ResumeParser:
         return items
 
     # ------------------------------------------------------------------
+    # File-type text extraction (fast path for non-LaTeX formats)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_text_from_pdf(path: Path) -> str:
+        """Extract plain text from a PDF using pymupdf (already in deps as fitz)."""
+        import fitz  # pymupdf
+        doc = fitz.open(str(path))
+        pages = [page.get_text() for page in doc]
+        doc.close()
+        return "\n".join(pages)
+
+    @staticmethod
+    def _extract_text_from_docx(path: Path) -> str:
+        """Extract plain text from a DOCX file using python-docx."""
+        from docx import Document
+        doc = Document(str(path))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+    def _extract_raw_text(self, path: Path) -> str:
+        """Dispatch to the right extractor based on file extension."""
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            return self._extract_text_from_pdf(path)
+        if suffix in (".docx", ".doc"):
+            return self._extract_text_from_docx(path)
+        # .tex or plain text — read as UTF-8
+        return path.read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Regex parse quality check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_meaningful_sections(sections: ResumeSection) -> bool:
+        """Return True if the regex parser found at least one non-empty section."""
+        return bool(
+            sections.experience
+            or sections.projects
+            or sections.education
+            or sections.skills
+        )
+
+    # ------------------------------------------------------------------
+    # LLM fallback parser
+    # ------------------------------------------------------------------
+
+    def _llm_parse_resume(self, raw_text: str) -> Tuple[PersonalInfo, ResumeSection]:
+        """
+        Use an LLM to extract structured resume data from plain text.
+        Called when the regex fast-path fails (unknown template, PDF, DOCX).
+        Returns (PersonalInfo, ResumeSection) ready for SQL + embedding.
+        """
+        from app.utils.llm import generate_for_task, Prompt
+
+        system_prompt = (
+            "You are a resume parser. Extract structured information from the resume text below.\n\n"
+            "Rules:\n"
+            "- For 'experience' and 'projects' sections, split into one item per company/project. "
+            "Include all bullet points in that item's content.\n"
+            "- For 'education', 'skills', 'achievements', 'relevant_coursework': put the full "
+            "section text in content (no items array needed).\n"
+            "- Use only these section types: experience, projects, education, skills, "
+            "achievements, relevant_coursework.\n"
+            "- If a section is absent, omit it.\n"
+            "- Extract URLs exactly as written (github.com/..., linkedin.com/...). "
+            "Leave fields empty string if not found."
+        )
+        user_prompt = f"Parse this resume:\n\n{raw_text[:12000]}"  # cap at ~12K chars
+
+        try:
+            resp = generate_for_task(
+                "resume_parsing",
+                Prompt(system=system_prompt, user=user_prompt),
+                _LLMResumeOutput,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"LLM resume parser unavailable: {exc}") from exc
+
+        if not resp.schema_matched or resp.parsed is None:
+            raise ValueError("LLM resume parser returned a malformed response")
+
+        return self._llm_output_to_resume(resp.parsed)
+
+    def _llm_output_to_resume(
+        self, out: _LLMResumeOutput
+    ) -> Tuple[PersonalInfo, ResumeSection]:
+        """Convert the LLM-extracted output to our domain models."""
+        personal = PersonalInfo(
+            name=out.name     or "Unknown",
+            email=out.email   or "Unknown",
+            phone=out.phone   or "Unknown",
+            github=out.github   or "",
+            linkedin=out.linkedin or "",
+        )
+
+        sections = ResumeSection()
+        for sec in out.sections:
+            stype = sec.type.lower().strip()
+
+            if stype in ATOMIC_SECTIONS:
+                items: List[AtomicItem] = []
+                for it in sec.items:
+                    text = (it.content or "").strip()
+                    if not text:
+                        continue
+                    items.append(AtomicItem(
+                        name=it.name,
+                        role=it.role,
+                        content_latex=text,   # plain text doubles as latex for non-LaTeX sources
+                        content_text=text,
+                    ))
+                if items and hasattr(sections, stype):
+                    setattr(sections, stype, items)
+
+            elif stype in FLAT_SECTIONS:
+                text = (sec.content or "").strip()
+                if text and hasattr(sections, stype):
+                    setattr(sections, stype, SectionContent(
+                        content_latex=text,
+                        content_text=text,
+                    ))
+
+        return personal, sections
+
+    # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
 
@@ -271,6 +426,7 @@ class ResumeParser:
         section_name: str,
         content_latex: Optional[str],
         content_text: Optional[str],
+        section_type: str = "flat",
     ) -> int:
         """
         Inserts one row into resume_sections and returns its id.
@@ -278,10 +434,11 @@ class ResumeParser:
         resume_section_items row can carry a valid section_id FK.
         """
         return self.db.add_one("resume_sections", {
-            "resume_id": resume_id,
+            "resume_id":    resume_id,
             "section_name": section_name,
             "content_latex": content_latex,
-            "content_text": content_text,
+            "content_text":  content_text,
+            "section_type":  section_type,
         })
 
     def _persist_section_items(
@@ -409,6 +566,7 @@ class ResumeParser:
                 resume_id, sec_name,
                 content_latex=full_latex,
                 content_text=full_text,
+                section_type="atomic",
             )
 
             atomic_rows[sec_name] = self._persist_section_items(
@@ -417,25 +575,58 @@ class ResumeParser:
 
         # 3. Embed everything into ChromaDB
         self.chunk_and_embed(resume_id, personal, resume_sections, atomic_rows)
+
+        # 4. Create a default layout row for this resume
+        try:
+            self.db.add_one("resume_layouts", {
+                "resume_id":   resume_id,
+                "template_id": "classic",
+                "section_order": json.dumps(resume_cnf.get("resume_order", [])),
+            })
+        except Exception:
+            pass  # ignore — layout row may already exist
+
         return resume_id
     # ------------------------------------------------------------------
     # Orchestrator
     # ------------------------------------------------------------------
 
     def run(self, resume_path: Path, user_id: int) -> ParsedResume:
-        """Parses a LaTeX resume, persists to SQL, and embeds into ChromaDB."""
+        """
+        Parse a resume and persist to SQL + ChromaDB.
+
+        Fast path: .tex files that match the known FontAwesome template are parsed
+        with regexes (zero LLM calls, instant).
+
+        Fallback: PDFs, DOCX files, and .tex files from unknown templates are
+        converted to plain text and sent to the LLM resume parser once.
+        """
         try:
-            with open(resume_path, "r", encoding="utf-8") as f:
-                latex_code = f.read()
+            suffix = resume_path.suffix.lower()
+            personal: PersonalInfo
+            resume_sections: ResumeSection
 
-            personal = self.extract_personal_info(self._strip_comments(latex_code))
-            resume_sections = self.parse_sections(latex_code)  # strips internally
+            if suffix == ".tex":
+                latex_code = resume_path.read_text(encoding="utf-8")
+                personal        = self.extract_personal_info(self._strip_comments(latex_code))
+                resume_sections = self.parse_sections(latex_code)
 
+                if not self._has_meaningful_sections(resume_sections):
+                    log.info("[parser] regex found no sections in %s — using LLM fallback", resume_path.name)
+                    raw_text        = self._clean_latex(latex_code)
+                    personal, resume_sections = self._llm_parse_resume(raw_text)
+                else:
+                    log.info("[parser] regex fast-path succeeded for %s", resume_path.name)
+            else:
+                log.info("[parser] non-LaTeX file (%s) — extracting text and using LLM parser", suffix)
+                raw_text        = self._extract_raw_text(resume_path)
+                personal, resume_sections = self._llm_parse_resume(raw_text)
 
+            resume_id = None
             if user_id is not None:
-                log.info(f"Storing resume for user_id={user_id}, name={personal.name}")
+                log.info("[parser] storing resume for user_id=%s name=%s", user_id, personal.name)
                 resume_id = self.add_to_sql_and_chroma(user_id, resume_path, personal, resume_sections)
-                
+
             return ParsedResume(
                 resume_id=str(resume_id) if resume_id else "N/A",
                 resume_path=str(resume_path),
@@ -444,5 +635,5 @@ class ResumeParser:
             )
 
         except Exception as e:
-            log.error(f"Error processing resume {resume_path}: {e}")
+            log.error("[parser] error processing %s: %s", resume_path, e)
             raise

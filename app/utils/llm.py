@@ -83,11 +83,12 @@ _ROUTING_PATH = Path("config/task_routing.toml")
 
 # Hard-coded defaults — used when task_routing.toml is missing.
 _DEFAULT_ROUTING: dict = {
-    "scoring":    {"provider": "gemini", "model": "gemini-3.5-flash",        "fallback": {"provider": "gemini", "model": "gemini-2.5-flash"}},
-    "analysis":   {"provider": "gemini", "model": "gemini-3.5-flash",        "fallback": {"provider": "gemini", "model": "gemini-2.5-flash"}},
-    "jd_parsing": {"provider": "gemini", "model": "gemini-2.5-flash"},
-    "editing":    {"provider": "gemini", "model": "gemini-2.5-flash"},
-    "generation": {"provider": "groq",   "model": "llama-3.3-70b-versatile", "fallback": {"provider": "gemini", "model": "gemini-2.5-flash-lite"}},
+    "scoring":        {"provider": "gemini", "model": "gemini-3.5-flash",        "fallback": {"provider": "gemini", "model": "gemini-2.5-flash"}},
+    "analysis":       {"provider": "gemini", "model": "gemini-3.5-flash",        "fallback": {"provider": "gemini", "model": "gemini-2.5-flash"}},
+    "jd_parsing":     {"provider": "gemini", "model": "gemini-2.5-flash"},
+    "editing":        {"provider": "gemini", "model": "gemini-2.5-flash"},
+    "generation":     {"provider": "groq",   "model": "llama-3.3-70b-versatile", "fallback": {"provider": "gemini", "model": "gemini-2.5-flash-lite"}},
+    "resume_parsing": {"provider": "gemini", "model": "gemini-2.5-flash"},
 }
 
 

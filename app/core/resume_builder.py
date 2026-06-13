@@ -1,5 +1,10 @@
+import json
 import re
 import os
+from pathlib import Path
+
+import jinja2
+
 from app.utils.sqlite_handler import SQLHandler
 from app.models.resume_builder import ResumeBuilderInput
 from config.config import get_config_dict
@@ -116,7 +121,7 @@ class ResumeBuilder:
         self.current_resume = resume
         return resume
     
-    def count_lines(self, resume_latex: str|None = None) -> dict:
+    def count_lines(self, resume_latex: str | None = None) -> dict:
         """
         Compiles the LaTeX to PDF, then uses pdfinfo to get page count,
         and a line-counting TeX package to measure actual used lines.
@@ -215,3 +220,138 @@ class ResumeBuilder:
                     "lines_per_page":   lines_per_page,
                     "error":            str(e)
                 }
+
+
+# ---------------------------------------------------------------------------
+# Template-based renderer (Jinja2 + DB data)
+# ---------------------------------------------------------------------------
+
+class TemplateRenderer:
+    """
+    Render a resume from DB data using a Jinja2 LaTeX template.
+
+    Unlike ResumeBuilder (which accepts pre-assembled strings), this class
+    reads all data directly from SQLite using a resume_id, applies layout
+    preferences from the resume_layouts table, and renders the chosen template.
+
+    Available templates live in templates/resume/*.tex.j2.
+    """
+
+    TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates" / "resume"
+
+    def __init__(self) -> None:
+        self._env: jinja2.Environment | None = None
+
+    def _get_env(self) -> jinja2.Environment:
+        if self._env is None:
+            self._env = jinja2.Environment(
+                loader=jinja2.FileSystemLoader(str(self.TEMPLATES_DIR)),
+                keep_trailing_newline=True,
+                undefined=jinja2.Undefined,
+            )
+            self._env.filters["enumerate"] = lambda lst: list(enumerate(lst or []))
+        return self._env
+
+    def render(
+        self,
+        resume_id: int,
+        template_id: str | None = None,
+        section_order: list[str] | None = None,
+        font_size: int | None = None,
+        margin: float | None = None,
+        section_space: float | None = None,
+        subsection_space: float | None = None,
+    ) -> str:
+        """
+        Render `resume_id` using the given (or stored) template and layout.
+
+        Caller overrides take precedence over stored layout, which takes
+        precedence over global defaults.
+        """
+        db = SQLHandler()
+
+        resume_row = db.fetch_one("resumes", filters={"id": resume_id})
+        if not resume_row:
+            raise ValueError(f"Resume {resume_id} not found in DB")
+
+        user_row: dict = db.fetch_one("users", filters={"id": resume_row.get("user_id")}) or {}
+
+        # Layout from DB (resume_layouts table may not exist yet)
+        layout: dict = {}
+        try:
+            layout = db.fetch_one("resume_layouts", filters={"resume_id": resume_id}) or {}
+        except Exception:
+            pass
+
+        # Resolve params: caller > DB layout > global defaults
+        tpl_id        = template_id   or layout.get("template_id")       or "classic"
+        sec_order     = section_order or self._parse_json_list(layout.get("section_order")) or DEFAULT_RESUME_SECTION_ORDER
+        fsize         = font_size     or layout.get("font_size")          or DEFAULT_RESUME_FONT_SIZE
+        marg          = margin        or layout.get("margin")             or 0.65
+        sec_sp        = section_space or DEFAULT_RESUME_SECTION_VSPACE
+        sub_sp        = subsection_space or DEFAULT_RESUME_SUBSECTION_VSPACE
+
+        # Personal info
+        github_url    = user_row.get("github") or DEFAULT_PERSONAL_INFO["github"]
+        github_handle = github_url.rstrip("/").split("/")[-1] if github_url else DEFAULT_PERSONAL_INFO["github_handle"]
+        linkedin_url  = user_row.get("linkedin") or DEFAULT_PERSONAL_INFO["linkedin"]
+        display_name  = user_row.get("name") or resume_row.get("name") or DEFAULT_PERSONAL_INFO["name"]
+
+        personal = {
+            "name":          display_name,
+            "email":         user_row.get("email") or resume_row.get("email") or DEFAULT_PERSONAL_INFO["email"],
+            "phone":         user_row.get("phone_number") or DEFAULT_PERSONAL_INFO["phone_number"],
+            "github":        github_url,
+            "github_handle": github_handle,
+            "linkedin":      linkedin_url,
+            "linkedin_name": display_name,
+        }
+
+        # Sections
+        sections: list[dict] = []
+        for sec_key in sec_order:
+            heading = SECTION_HEADINGS.get(sec_key, sec_key.replace("_", " ").title())
+            if sec_key in FLAT_SECTIONS:
+                row     = db.fetch_one("resume_sections", filters={"resume_id": resume_id, "section_name": sec_key})
+                content = ((row or {}).get("content_latex") or "").replace("\\end{document}", "").strip()
+                if content:
+                    sections.append({"key": sec_key, "heading": heading, "type": "flat",
+                                     "content": content, "items": None})
+            elif sec_key in ATOMIC_SECTIONS:
+                rows  = db.execute_raw(
+                    "SELECT content_latex FROM resume_section_items "
+                    "WHERE resume_id = :rid AND section_name = :sec AND is_latest = 1 "
+                    "ORDER BY item_index",
+                    {"rid": resume_id, "sec": sec_key},
+                ) or []
+                items = [r["content_latex"].replace("\\end{document}", "")
+                         for r in rows if r.get("content_latex")]
+                if items:
+                    sections.append({"key": sec_key, "heading": heading, "type": "atomic",
+                                     "content": None, "items": items})
+
+        env      = self._get_env()
+        template = env.get_template(f"{tpl_id}.tex.j2")
+        return template.render(
+            font_size=fsize,
+            margin=marg,
+            section_space=sec_sp,
+            subsection_space=sub_sp,
+            personal=personal,
+            sections=sections,
+        )
+
+    @staticmethod
+    def _parse_json_list(val) -> list | None:
+        if not val:
+            return None
+        if isinstance(val, list):
+            return val
+        try:
+            return json.loads(val)
+        except Exception:
+            return None
+
+    def list_templates(self) -> list[str]:
+        """Return template IDs (without .tex.j2) available in templates/resume/."""
+        return [p.name.replace(".tex.j2", "") for p in self.TEMPLATES_DIR.glob("*.tex.j2")]
