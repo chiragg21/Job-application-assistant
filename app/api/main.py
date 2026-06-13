@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import jd, resume, edit, generate, score
+from app.api.routes import jd, resume, edit, generate, score, keys
 from app.utils import get_logger
 
 log = get_logger(__name__)
@@ -41,7 +41,9 @@ def _prewarm_embeddings() -> None:
 async def lifespan(app: FastAPI):
     log.info("Job-Assistant API starting up")
     from app.graph.edit_graph import evict_old_threads
+    from app.api.routes.keys import load_user_keys
     evict_old_threads()
+    load_user_keys()
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _prewarm_embeddings)
     yield
@@ -76,6 +78,7 @@ app.include_router(resume.router)
 app.include_router(edit.router)
 app.include_router(generate.router)
 app.include_router(score.router)
+app.include_router(keys.router)
 
 
 # -----------------------------------------------------------------------

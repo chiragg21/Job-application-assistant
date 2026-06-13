@@ -72,6 +72,11 @@ class EditGraphState(TypedDict, total=False):
     generation_results: dict       # {"coverletter": str, "email": str, ...}
 
     # ------------------------------------------------------------------ #
+    # Session-level instructions                                           #
+    # ------------------------------------------------------------------ #
+    custom_instruction: str | None   # applied to all LLM edit calls this session
+
+    # ------------------------------------------------------------------ #
     # Control / diagnostics                                                #
     # ------------------------------------------------------------------ #
     stage:  str           # human-readable current stage label

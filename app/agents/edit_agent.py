@@ -32,8 +32,10 @@ class EditAgent:
         self.llmhandler = _llm
         self.db = SQLHandler()
 
-        self.section_name = ""
-        self.special_instruction = ""
+        self.section_name       = ""
+        self.item_name          = ""
+        self.special_instruction  = ""   # per-call (score feedback, paraphrase instruction)
+        self.global_instruction   = ""   # session-wide custom instruction
 
     # ------------------------------------------------------------------
     # Prompt helpers
@@ -126,6 +128,8 @@ Your task is to rewrite resume bullets so they pass ATS filters AND impress huma
 - Only return lines that genuinely improve — empty lists are fine.
 
 {self._jd_context()}
+
+{self._special_instruction(self.global_instruction)}
 
 {self._prompt_guardrails()}
 

@@ -66,8 +66,11 @@ _cfg = _load_cfg()
 # ── client singleton ──────────────────────────────────────────────────────────
 
 llm: LLMClient = LLMClient(
-    keys={'gemini_keys':_cfg.get("gemini_api", {}).get("api_keys", []),
-          'openai_keys':_cfg.get("openai_api", {}).get("api_keys", [])},
+    keys={
+        'gemini_keys': _cfg.get("gemini_api", {}).get("api_keys", []),
+        'openai_keys': _cfg.get("openai_api", {}).get("api_keys", []),
+        'groq_keys':   _cfg.get("groq_api",   {}).get("api_keys", []),
+    },
     # storage_dir and quota_file default to ~/.infrakit/llm/
     # override via LLM_STATE_DIR / LLM_QUOTA_FILE in your config file:
     storage_dir=_cfg.get("LLM_STATE_DIR") or None,
@@ -76,6 +79,8 @@ llm: LLMClient = LLMClient(
     max_concurrent=int(_cfg.get("LLM_CONCURRENCY", 3)),
     openai_model=_cfg.get("OPENAI_MODEL") or None,
     gemini_model=_cfg.get("GEMINI_MODEL") or None,
+    groq_model=_cfg.get("groq_api", {}).get("model") or None,
+    fallback_order=["gemini", "groq"],   # auto-fallback when Gemini rate-limits
 )
 
 __all__ = ["llm", "Prompt"]

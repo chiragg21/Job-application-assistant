@@ -15,7 +15,12 @@ from __future__ import annotations
 import uuid
 import concurrent.futures
 
+import subprocess
+import tempfile
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, model_validator
 
 from langgraph.types import Command
@@ -100,6 +105,7 @@ class StartSessionRequest(BaseModel):
     jd_text:            str
     resume_path:        str | None = None   # absolute path to uploaded .tex file
     existing_resume_id: int | None = None   # use a specific DB resume for personal info
+    custom_instruction: str | None = None   # global instruction applied to all edit prompts
     # If neither resume_path nor existing_resume_id is supplied the graph loads
     # the most-recent resume for user_id automatically (user-profile mode).
 
@@ -191,6 +197,8 @@ def start_session(req: StartSessionRequest):
         "jd_text":  req.jd_text,
         "cycle_id": 1,
     }
+    if req.custom_instruction and req.custom_instruction.strip():
+        initial_state["custom_instruction"] = req.custom_instruction.strip()
     if req.existing_resume_id:
         initial_state["existing_resume_id"] = req.existing_resume_id
     else:
@@ -518,3 +526,86 @@ def quick_generate(req: QuickGenerateRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ======================================================================
+# GET /edit/{thread_id}/export
+# ======================================================================
+
+@router.get("/{thread_id}/export")
+def export_session(
+    thread_id:        str,
+    format:           str        = "tex",   # "tex" | "pdf"
+    section_order:    str | None = None,
+    section_space:    float | None = None,
+    subsection_space: float | None = None,
+    font_size:        int | None   = None,
+):
+    """
+    Export the current resume as a downloadable .tex or compiled .pdf file.
+
+    Available at any point during an edit session (not just at the finish screen).
+    For `format=pdf`, pdflatex must be installed and in PATH.
+    """
+    config = _config(thread_id)
+    try:
+        state_values = edit_graph.get_state(config).values
+        if not state_values.get("edit_cycle_dict"):
+            raise HTTPException(status_code=400, detail="Edit state not ready yet.")
+
+        agent      = _rebuild_agent(state_values)
+        order_list = section_order.split(",") if section_order else None
+        latex      = pl.build_preview(
+            edit_agent       = agent,
+            user_id          = state_values.get("user_id"),
+            section_order    = order_list,
+            section_space    = section_space,
+            subsection_space = subsection_space,
+            font_size        = font_size,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    short_id = thread_id[:8]
+
+    if format == "tex":
+        return Response(
+            content=latex.encode("utf-8"),
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="resume_{short_id}.tex"'},
+        )
+
+    if format == "pdf":
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tex_file = Path(tmpdir) / "resume.tex"
+                tex_file.write_text(latex, encoding="utf-8")
+                result = subprocess.run(
+                    ["pdflatex", "-interaction=nonstopmode", "-output-directory", tmpdir, str(tex_file)],
+                    capture_output=True,
+                    timeout=60,
+                )
+                pdf_file = Path(tmpdir) / "resume.pdf"
+                if not pdf_file.exists():
+                    stderr = result.stderr.decode(errors="replace")[:400]
+                    raise HTTPException(status_code=500, detail=f"pdflatex failed: {stderr}")
+                pdf_bytes = pdf_file.read_bytes()
+        except HTTPException:
+            raise
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=501,
+                detail="pdflatex is not installed or not in PATH. Use format=tex instead.",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="resume_{short_id}.pdf"'},
+        )
+
+    raise HTTPException(status_code=422, detail=f"Unknown format '{format}'. Use 'tex' or 'pdf'.")

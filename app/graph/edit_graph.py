@@ -66,10 +66,11 @@ def _rebuild_agent(state: EditGraphState):
     # EditAgent.__init__ calls init_root which would reset the cycle.
     # We bypass that by constructing the agent and wiring the cycle directly.
     agent = object.__new__(EditAgent)
-    agent.editing_cycle     = cycle
-    agent.section_name      = ""
-    agent.item_name         = ""
+    agent.editing_cycle       = cycle
+    agent.section_name        = ""
+    agent.item_name           = ""
     agent.special_instruction = ""
+    agent.global_instruction  = ""
 
     from app.utils.llm import llm as _llm
     from app.utils import SQLHandler
@@ -224,8 +225,13 @@ def node_build_edit_state(state: EditGraphState) -> dict:
 def node_generate_suggestions(state: EditGraphState) -> dict:
     log.info("[graph] generate_suggestions")
     try:
-        agent    = _rebuild_agent(state)
-        feedback = state.get("score_feedback")
+        agent              = _rebuild_agent(state)
+        feedback           = state.get("score_feedback")
+        custom_instruction = state.get("custom_instruction")
+
+        # Combine session-level custom instruction with score feedback (if any)
+        instruction_parts = [p for p in [custom_instruction, feedback] if p]
+        agent.global_instruction = "\n\n".join(instruction_parts)
 
         if feedback:
             pl.generate_suggestions_with_score_feedback(agent, feedback)
