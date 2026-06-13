@@ -30,6 +30,7 @@ dependencies = [
     "streamlit>=1.40.0",
     "uvicorn>=0.41.0",
     "groq>=1.4.0",
+    "langgraph-checkpoint-sqlite>=3.1.0",
 ]
 
 [tool.pyright]

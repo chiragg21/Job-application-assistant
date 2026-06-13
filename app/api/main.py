@@ -40,8 +40,9 @@ def _prewarm_embeddings() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Job-Assistant API starting up")
-    from app.graph.edit_graph import evict_old_threads
+    from app.graph.edit_graph import evict_old_threads, _checkpointer
     from app.api.routes.keys import load_user_keys
+    _checkpointer.setup()   # ensure SQLite checkpoint tables exist
     evict_old_threads()
     load_user_keys()
     loop = asyncio.get_event_loop()

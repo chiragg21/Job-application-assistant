@@ -30,7 +30,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
-from utils.logger import get_logger
+from app.utils.logger import get_logger
 
 log = get_logger(__name__)
 

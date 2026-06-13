@@ -451,11 +451,26 @@ Complete before starting the React migration (Sprint 3).
 - [x] `(0.6)` Rewrite `_resume_suggestions()` prompt: impact-first bullets, XYZ formula, action verb upgrade — `edit_agent.py`
 - [x] `(0.7)` Cache `_resume_suggestions()` output by `sha256(resume_latex + jd_hash)` — `gen_cache.py` + `edit_agent.py`
 
-**Sprint 1 — next up (awaiting infrakit library update for Groq + add_key):**
-- [ ] `(1.1)` API key usage dashboard endpoint `GET /api/keys/status` + `PATCH /api/keys/quota` — `app/api/routes/keys.py` (new)
-- [ ] `(1.2)` Register Groq API key + wire as fallback provider in `LLMClient` — `app/utils/llm.py`, `config/config.ini` *(needs infrakit update)*
-- [ ] `(1.3)` Exponential backoff retry on 429 responses — `app/utils/llm.py` *(needs infrakit update or wrapper)*
-- [ ] `(1.4)` User-managed keys settings endpoint (add key + set quota, persist to `.env`, re-init) — `app/api/routes/keys.py` *(needs infrakit `add_key()`)*
-- [ ] `(1.5)` Add `app/core/jd_extractor.py` (Jina Reader) + `POST /jd/extract-from-url` — `app/api/routes/jd.py`
-- [ ] `(1.6)` Global custom instruction field on edit session start — `app/api/routes/edit.py`, `app/graph/edit_graph.py`
-- [ ] `(1.7)` Mid-session TeX/PDF export endpoint at every stage — `app/api/routes/edit.py`
+**Sprint 1 — ✓ COMPLETE:**
+- [x] `(1.1)` API key usage dashboard endpoint `GET /keys/status` + `PATCH /keys/quota` — `app/api/routes/keys.py`
+- [x] `(1.2)` Register Groq API key + wire as fallback provider — `app/utils/llm.py`, `config/config.ini`
+- [x] `(1.3)` Exponential backoff retry (built into infrakit LLMClient v0.1.4)
+- [x] `(1.4)` User-managed keys endpoint `POST /keys`, `DELETE /keys/{provider}/{key_id}` with `data/user_keys.json` persistence
+- [x] `(1.5)` `app/core/jd_extractor.py` (Jina Reader) + `POST /jd/extract-from-url`
+- [x] `(1.6)` Global custom instruction field (`custom_instruction`) on edit session start
+- [x] `(1.7)` Mid-session TeX/PDF export `GET /edit/{thread_id}/export`
+
+**Sprint 2 — Persistence Layer (✓ 2.1–2.3 done; 2.4 deferred to backend backlog):**
+- [x] `(2.1)` Replace `MemorySaver` with SQLite-backed `SqliteSaver` (`langgraph-checkpoint-sqlite`) — `app/graph/edit_graph.py`
+- [x] `(2.2)` Persist completed sessions to DB — `db/migrations/008_edit_sessions.sql`, `app/utils/sqlite_handler.py`, `POST /edit/{thread_id}/finish`, `GET /edit/sessions/{user_id}`
+- [x] `(2.3)` Full-resume diff endpoint `GET /edit/{thread_id}/diff` — `app/api/routes/edit.py`
+- [ ] `(2.4)` Resume format flexibility — LLM fallback parser for PDF/DOCX/any LaTeX template *(deferred — frontend starts now)*
+
+**Sprint 3 — React + Next.js Frontend ← NEXT UP:**
+Frontend is starting now. Backend is ready enough: all API endpoints exist, sessions persist,
+export works, diff works. Placeholders will be used for: streaming responses (spinner instead),
+re-open sessions (button visible but disabled), PDF/DOCX upload (LaTeX only for now).
+`streamlit_app.py` kept running in parallel until all screens are verified.
+
+**Backend backlog (parallel to frontend):**
+- [ ] `(2.4)` Resume format flexibility — PDF/DOCX/any LaTeX template parser

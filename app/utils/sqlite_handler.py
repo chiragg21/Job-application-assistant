@@ -729,3 +729,145 @@ class SQLHandler:
             },
         )
         log.info("Application finalised", extra={"app_id": app_id, "path": resume_version_path})
+
+    # ── Sprint 2: Edit Sessions ───────────────────────────────────────────
+
+    def create_edit_session(
+        self,
+        user_id: int,
+        thread_id: str,
+        job_id: int | None = None,
+        custom_instruction: str | None = None,
+    ) -> int:
+        """
+        Insert an active edit_sessions row and return the session id.
+        Called at the start of a new editing session.
+
+        Example:
+            sid = handler.create_edit_session(user_id=1, thread_id="abc-123", job_id=7)
+        """
+        return self.add_one("edit_sessions", {
+            "user_id":            user_id,
+            "job_id":             job_id,
+            "thread_id":          thread_id,
+            "status":             "active",
+            "custom_instruction": custom_instruction,
+        })
+
+    def finish_edit_session(
+        self,
+        thread_id: str,
+        final_latex: str | None = None,
+        job_id: int | None = None,
+    ) -> None:
+        """
+        Mark an edit session as completed and save the final LaTeX snapshot.
+        Optionally fills in job_id if not set at creation time.
+
+        Example:
+            handler.finish_edit_session(thread_id="abc-123", final_latex="\\documentclass{...}")
+        """
+        new_values: dict = {
+            "status":      "completed",
+            "finished_at": "CURRENT_TIMESTAMP",
+        }
+        if final_latex is not None:
+            new_values["final_latex"] = final_latex
+        if job_id is not None:
+            new_values["job_id"] = job_id
+        self.execute_raw(
+            """
+            UPDATE edit_sessions
+            SET status = 'completed',
+                finished_at = CURRENT_TIMESTAMP
+                {latex_clause}
+                {job_clause}
+            WHERE thread_id = :thread_id
+            """.format(
+                latex_clause=", final_latex = :final_latex" if final_latex is not None else "",
+                job_clause=", job_id = :job_id" if job_id is not None else "",
+            ),
+            {
+                "thread_id":   thread_id,
+                **({"final_latex": final_latex} if final_latex is not None else {}),
+                **({"job_id": job_id} if job_id is not None else {}),
+            },
+        )
+        log.info("Edit session completed", extra={"thread_id": thread_id})
+
+    def abandon_edit_session(self, thread_id: str) -> None:
+        """Mark a session as abandoned (e.g. on error or explicit cancel)."""
+        self.execute_raw(
+            "UPDATE edit_sessions SET status = 'abandoned', finished_at = CURRENT_TIMESTAMP "
+            "WHERE thread_id = :thread_id",
+            {"thread_id": thread_id},
+        )
+
+    def get_edit_session_by_thread(self, thread_id: str) -> dict | None:
+        """Fetch an edit_sessions row by thread_id."""
+        return self.fetch_one("edit_sessions", filters={"thread_id": thread_id})
+
+    def list_edit_sessions(
+        self,
+        user_id: int,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """
+        List edit sessions for a user, newest first.
+        Optionally filter by status ('active' | 'completed' | 'abandoned').
+
+        Example:
+            sessions = handler.list_edit_sessions(user_id=1, status='completed')
+        """
+        where = "WHERE es.user_id = :user_id"
+        params: dict = {"user_id": user_id, "limit": limit}
+        if status:
+            where += " AND es.status = :status"
+            params["status"] = status
+        rows = self.execute_raw(
+            f"""
+            SELECT es.id, es.thread_id, es.status, es.custom_instruction,
+                   es.created_at, es.finished_at,
+                   j.company, j.role
+            FROM edit_sessions es
+            LEFT JOIN jobs j ON j.id = es.job_id
+            {where}
+            ORDER BY es.created_at DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+        return rows if isinstance(rows, list) else []
+
+    def save_session_documents(
+        self,
+        session_id: int,
+        docs: dict[str, str],
+    ) -> None:
+        """
+        Bulk-insert generated documents for a session.
+        docs is a {doc_type: content} mapping.
+
+        Example:
+            handler.save_session_documents(session_id=3, docs={
+                "cover_letter": "Dear Hiring Manager...",
+                "email": "Hi John...",
+            })
+        """
+        rows = [
+            {"session_id": session_id, "doc_type": doc_type, "content": content}
+            for doc_type, content in docs.items()
+            if content
+        ]
+        if rows:
+            self.bulk_insert("session_documents", rows)
+
+    def get_session_documents(self, session_id: int) -> list[dict]:
+        """Fetch all documents for a session."""
+        rows = self.execute_raw(
+            "SELECT id, doc_type, content, created_at "
+            "FROM session_documents WHERE session_id = :sid ORDER BY id",
+            {"sid": session_id},
+        )
+        return rows if isinstance(rows, list) else []

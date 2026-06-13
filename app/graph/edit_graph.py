@@ -24,14 +24,16 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import traceback
 import concurrent.futures
+from pathlib import Path
 from typing import Any
 
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from app.graph.state import EditGraphState
 from app.models.jd import ParsedJD
@@ -647,11 +649,17 @@ def build_edit_graph() -> StateGraph:
 
 
 # ======================================================================
-# Compiled graph singleton (with in-memory checkpointer)
+# Compiled graph singleton (SQLite-backed checkpointer)
+#
+# Sessions are written to data/checkpoints.db so they survive server
+# restarts.  The file is in data/ which is gitignored.
 # ======================================================================
 
-_checkpointer = MemorySaver()
-edit_graph    = build_edit_graph().compile(checkpointer=_checkpointer, interrupt_before=[])
+_CHECKPOINT_DB = Path("data/checkpoints.db")
+_CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+_checkpoint_conn = sqlite3.connect(str(_CHECKPOINT_DB), check_same_thread=False)
+_checkpointer   = SqliteSaver(_checkpoint_conn)
+edit_graph      = build_edit_graph().compile(checkpointer=_checkpointer, interrupt_before=[])
 
 # ======================================================================
 # Thread TTL tracking — evict sessions older than _TTL_SECONDS to
@@ -668,13 +676,21 @@ def register_thread(thread_id: str) -> None:
 
 
 def evict_old_threads() -> None:
-    """Remove threads older than _TTL_SECONDS from MemorySaver storage."""
+    """Remove threads older than _TTL_SECONDS from the SQLite checkpointer."""
     cutoff  = time.time() - _TTL_SECONDS
     expired = [tid for tid, ts in _thread_timestamps.items() if ts < cutoff]
     for tid in expired:
         try:
-            if hasattr(_checkpointer, "storage") and tid in _checkpointer.storage:
-                del _checkpointer.storage[tid]
+            _checkpoint_conn.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?", (tid,)
+            )
+            _checkpoint_conn.execute(
+                "DELETE FROM checkpoint_blobs WHERE thread_id = ?", (tid,)
+            )
+            _checkpoint_conn.execute(
+                "DELETE FROM checkpoint_writes WHERE thread_id = ?", (tid,)
+            )
+            _checkpoint_conn.commit()
         except Exception:
             pass
         del _thread_timestamps[tid]

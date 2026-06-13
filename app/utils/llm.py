@@ -65,11 +65,23 @@ _cfg = _load_cfg()
 
 # ── client singleton ──────────────────────────────────────────────────────────
 
+def _key_list(val: object) -> list[str]:
+    """Config loader may return a bare string when only one key is configured.
+    Wrap it in a list so LLMClient never iterates over individual characters."""
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [v for v in val if isinstance(v, str) and v.strip()]
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
+    return []
+
+
 llm: LLMClient = LLMClient(
     keys={
-        'gemini_keys': _cfg.get("gemini_api", {}).get("api_keys", []),
-        'openai_keys': _cfg.get("openai_api", {}).get("api_keys", []),
-        'groq_keys':   _cfg.get("groq_api",   {}).get("api_keys", []),
+        'gemini_keys': _key_list(_cfg.get("gemini_api", {}).get("api_keys", [])),
+        'openai_keys': _key_list(_cfg.get("openai_api", {}).get("api_keys", [])),
+        'groq_keys':   _key_list(_cfg.get("groq_api",   {}).get("api_keys", [])),
     },
     # storage_dir and quota_file default to ~/.infrakit/llm/
     # override via LLM_STATE_DIR / LLM_QUOTA_FILE in your config file:

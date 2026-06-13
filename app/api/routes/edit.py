@@ -4,11 +4,14 @@
 #
 # Session lifecycle
 # -----------------
-#   POST /edit/start         → starts the graph, returns thread_id + first interrupt
-#   POST /edit/{tid}/resume  → resume after an interrupt with the user's response
-#   GET  /edit/{tid}/state   → inspect full graph state (debug / polling)
-#   GET  /edit/{tid}/preview → compile current LaTeX to a preview string
-#   POST /edit/{tid}/score   → score current state and return feedback
+#   POST /edit/start                   → starts the graph, returns thread_id + first interrupt
+#   POST /edit/{tid}/resume            → resume after an interrupt with the user's response
+#   GET  /edit/{tid}/state             → inspect full graph state (debug / polling)
+#   GET  /edit/{tid}/preview           → compile current LaTeX to a preview string
+#   POST /edit/{tid}/score             → score current state and return feedback
+#   POST /edit/{tid}/finish            → mark session complete, save to DB
+#   GET  /edit/{tid}/diff              → full-resume original vs final diff
+#   GET  /edit/sessions/{user_id}      → list past sessions for a user
 
 from __future__ import annotations
 
@@ -30,7 +33,8 @@ from app.models.jd import ParsedJD
 from app.models.resume import ParsedResume
 from app.agents.generator_agent import generate as _generate_fn
 import app.core.pipeline as pl
-from app.utils import get_logger
+from app.utils import get_logger, SQLHandler
+from app.core.retriever import FLAT_SECTIONS, ATOMIC_SECTIONS
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/edit", tags=["Edit Session"])
@@ -211,6 +215,21 @@ def start_session(req: StartSessionRequest):
 
     register_thread(thread_id)
     interrupt_payload = _get_interrupt(thread_id)
+
+    # Persist session row — job_id is now in state after parse_and_retrieve
+    try:
+        state_after = edit_graph.get_state(config).values
+        job_id = state_after.get("job_id")
+        db = SQLHandler()
+        db.create_edit_session(
+            user_id=req.user_id,
+            thread_id=thread_id,
+            job_id=job_id,
+            custom_instruction=req.custom_instruction,
+        )
+    except Exception as exc:
+        log.warning("[edit] failed to persist session to DB: %s", exc)
+
     return StartSessionResponse(thread_id=thread_id, interrupt=interrupt_payload)
 
 
@@ -609,3 +628,199 @@ def export_session(
         )
 
     raise HTTPException(status_code=422, detail=f"Unknown format '{format}'. Use 'tex' or 'pdf'.")
+
+
+# ======================================================================
+# POST /edit/{thread_id}/finish
+# ======================================================================
+
+class FinishResponse(BaseModel):
+    thread_id:   str
+    final_latex: str | None
+    session_id:  int | None
+    documents_saved: int
+
+
+@router.post("/{thread_id}/finish", response_model=FinishResponse)
+def finish_session(
+    thread_id:    str,
+    section_order: str | None = None,
+    documents:    dict = {},
+):
+    """
+    Mark an edit session as complete.
+
+    Builds the final LaTeX from current state and persists it (along with
+    any generated documents) to the DB.  Safe to call even if the graph
+    has already reached END.
+
+    Query params:
+        section_order   — comma-separated section order for the final LaTeX
+        documents       — {doc_type: content} JSON body (optional)
+    """
+    config = _config(thread_id)
+    try:
+        state_values = edit_graph.get_state(config).values
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Thread '{thread_id}' not found.")
+
+    # Build final LaTeX if edit state is available
+    final_latex: str | None = None
+    if state_values.get("edit_cycle_dict"):
+        try:
+            agent      = _rebuild_agent(state_values)
+            order_list = section_order.split(",") if section_order else None
+            final_latex = pl.build_preview(
+                edit_agent    = agent,
+                user_id       = state_values.get("user_id"),
+                section_order = order_list,
+            )
+        except Exception as exc:
+            log.warning("[edit] could not build final LaTeX at finish: %s", exc)
+
+    # Persist to DB
+    session_id: int | None = None
+    docs_saved = 0
+    try:
+        db     = SQLHandler()
+        job_id = state_values.get("job_id")
+        db.finish_edit_session(
+            thread_id=thread_id,
+            final_latex=final_latex,
+            job_id=job_id,
+        )
+        row = db.get_edit_session_by_thread(thread_id)
+        if row:
+            session_id = row["id"]
+            if documents and session_id:
+                db.save_session_documents(session_id, documents)
+                docs_saved = len(documents)
+    except Exception as exc:
+        log.warning("[edit] failed to persist finish to DB: %s", exc)
+
+    return FinishResponse(
+        thread_id=thread_id,
+        final_latex=final_latex,
+        session_id=session_id,
+        documents_saved=docs_saved,
+    )
+
+
+# ======================================================================
+# GET /edit/sessions/{user_id}
+# ======================================================================
+
+class SessionSummary(BaseModel):
+    id:                 int
+    thread_id:          str
+    status:             str
+    company:            str | None
+    role:               str | None
+    custom_instruction: str | None
+    created_at:         str
+    finished_at:        str | None
+
+
+@router.get("/sessions/{user_id}", response_model=list[SessionSummary])
+def list_sessions(
+    user_id: int,
+    status:  str | None = None,
+    limit:   int        = 50,
+):
+    """
+    List past edit sessions for a user, newest first.
+    Optional `status` filter: active | completed | abandoned.
+    """
+    try:
+        db   = SQLHandler()
+        rows = db.list_edit_sessions(user_id=user_id, status=status, limit=limit)
+        return [SessionSummary(**r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ======================================================================
+# GET /edit/{thread_id}/diff
+# ======================================================================
+
+class SectionDiff(BaseModel):
+    original: str
+    final:    str
+    changed:  bool
+
+
+class ItemDiff(BaseModel):
+    item:     str
+    original: str
+    final:    str
+    changed:  bool
+
+
+class ResumeDiff(BaseModel):
+    flat_sections:   dict[str, SectionDiff]
+    atomic_sections: dict[str, list[ItemDiff]]
+    has_changes:     bool
+
+
+@router.get("/{thread_id}/diff", response_model=ResumeDiff)
+def get_resume_diff(thread_id: str):
+    """
+    Return a full-resume diff: original (root state) vs current state.
+
+    Both flat sections (education, skills, …) and atomic sections
+    (experience items, project items) are compared.
+    """
+    config = _config(thread_id)
+    try:
+        state_values = edit_graph.get_state(config).values
+        if not state_values.get("edit_cycle_dict"):
+            raise HTTPException(status_code=400, detail="Edit state not ready yet.")
+
+        agent = _rebuild_agent(state_values)
+        cycle = agent.editing_cycle
+
+        root_state    = cycle.nodes[0].resume_state
+        current_state = cycle.current_state
+
+        flat: dict[str, SectionDiff] = {}
+        for sec in FLAT_SECTIONS:
+            root_sec    = root_state.get_section(sec)
+            current_sec = current_state.get_section(sec)
+            if root_sec is None and current_sec is None:
+                continue
+            orig  = root_sec.updated_section    if root_sec    else ""
+            final = current_sec.updated_section if current_sec else ""
+            flat[sec] = SectionDiff(original=orig, final=final, changed=(orig != final))
+
+        atomic: dict[str, list[ItemDiff]] = {}
+        for sec in ATOMIC_SECTIONS:
+            root_items    = getattr(root_state,    sec, []) or []
+            current_items = getattr(current_state, sec, []) or []
+            # Build name→item maps for reliable matching
+            root_by_name    = {it.item_name: it for it in root_items    if it}
+            current_by_name = {it.item_name: it for it in current_items if it}
+            all_names = list(dict.fromkeys(
+                [it.item_name for it in root_items    if it] +
+                [it.item_name for it in current_items if it]
+            ))
+            diffs: list[ItemDiff] = []
+            for name in all_names:
+                orig  = root_by_name[name].updated_section    if name in root_by_name    else ""
+                final = current_by_name[name].updated_section if name in current_by_name else ""
+                diffs.append(ItemDiff(item=name, original=orig, final=final, changed=(orig != final)))
+            if diffs:
+                atomic[sec] = diffs
+
+        has_changes = (
+            any(s.changed for s in flat.values()) or
+            any(d.changed for items in atomic.values() for d in items)
+        )
+        return ResumeDiff(
+            flat_sections=flat,
+            atomic_sections=atomic,
+            has_changes=has_changes,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
