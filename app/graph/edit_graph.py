@@ -74,10 +74,8 @@ def _rebuild_agent(state: EditGraphState):
     agent.special_instruction = ""
     agent.global_instruction  = ""
 
-    from app.utils.llm import llm as _llm
     from app.utils import SQLHandler
-    agent.llmhandler = _llm
-    agent.db         = SQLHandler()
+    agent.db = SQLHandler()
 
     return agent
 

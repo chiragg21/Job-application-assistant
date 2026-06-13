@@ -35,14 +35,14 @@ from pathlib import Path
 from typing import Optional
 
 import chromadb
-from chromadb.utils import embedding_functions
 
 from app.core.chroma_client import get_chroma_client
+from app.core.embeddings import get_ef
 from app.models.jd import ParsedJD
 from config.config import get_config_dict
 from app.utils.logger import get_logger
 from app.utils import SQLHandler
-from app.utils.llm import llm as _llm, Prompt
+from app.utils.llm import generate_for_task, Prompt
 
 log = get_logger(__name__)
 
@@ -96,12 +96,8 @@ class JDParser:
 
     def __init__(self):
         self.db         = SQLHandler()
-        self.llm_helper = _llm
 
-        self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL,
-            token=HF_TOKEN or None,
-        )
+        self.ef = get_ef()
         chroma = get_chroma_client()
         self._col_jd_chunks = chroma.get_or_create_collection(COL_JD_CHUNKS, embedding_function=self.ef)
         self._col_cached    = chroma.get_or_create_collection(COL_CACHED_OUTPUTS, embedding_function=self.ef)
@@ -163,10 +159,10 @@ class JDParser:
         )
 
         try:
-            result = self.llm_helper.generate(
+            result = generate_for_task(
+                "jd_parsing",
                 Prompt(system=system_prompt, user=f"Parse this job description:\n\n{jd_text}"),
-                provider="gemini",
-                response_model=ParsedJD,
+                ParsedJD,
             )
 
             if result.error:

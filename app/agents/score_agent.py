@@ -5,9 +5,8 @@ import hashlib
 import functools
 import numpy as np
 from typing import Optional
-from infrakit.llm import LLMClient
-from chromadb.utils import embedding_functions
-from app.utils.llm import llm as _llm, Prompt
+from app.core.embeddings import get_ef
+from app.utils.llm import generate_for_task, Prompt
 from app.utils.logger import get_logger
 from app.models.scoring import (
     ResumeScore, LLMScoreOutput, DimensionScore, ScoreDimension
@@ -18,9 +17,6 @@ from config.config import get_config_dict
 logger = get_logger(__name__)
 config = get_config_dict()
 
-_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name=config.get('rag_config', {}).get('embedding_model', 'all-mpnet-base-v2')
-)
 
 # In-memory score result cache — keyed by (resume_hash, jd_hash).
 # Avoids re-scoring the same resume+JD when the user views the score page
@@ -51,7 +47,7 @@ def _latex_to_text(latex: str) -> str:
 @functools.lru_cache(maxsize=256)
 def _get_embedding(text: str) -> tuple:
     """Cache embeddings by text content — avoids recomputing for the same JD or resume."""
-    return tuple(_ef([text])[0])
+    return tuple(get_ef()([text])[0])
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -149,20 +145,25 @@ Responsibilities: {jd.responsibilities[:5]}
     return system_prompt, prompt
 
 
-def _score_llm_dimensions(llm: LLMClient, resume_latex: str, jd: ParsedJD) -> LLMScoreOutput:
+def _score_llm_dimensions(resume_latex: str, jd: ParsedJD) -> Optional[LLMScoreOutput]:
     system_prompt, prompt = _build_llm_score_prompt(resume_latex, jd)
-    response = llm.generate(
-        Prompt(system=system_prompt, user=prompt),
-        provider="gemini",
-        response_model=LLMScoreOutput,
-    )
+    try:
+        response = generate_for_task(
+            "scoring",
+            Prompt(system=system_prompt, user=prompt),
+            LLMScoreOutput,
+        )
+    except RuntimeError as exc:
+        logger.warning("[ScoreAgent] all scoring models unavailable: %s", exc)
+        return None
     if not response.schema_matched or response.parsed is None:
-        raise ValueError("LLM response did not match LLMScoreOutput schema")
+        logger.warning("[ScoreAgent] schema mismatch — no parsed output")
+        return None
     result: LLMScoreOutput = response.parsed
     logger.info(
-        f"[ScoreAgent] LLM scores — "
-        f"ATS={result.ats_friendliness.score}, "
-        f"Quality={result.resume_quality.score}"
+        "[ScoreAgent] LLM scores — ATS=%s Quality=%s",
+        result.ats_friendliness.score,
+        result.resume_quality.score,
     )
     return result
 
@@ -181,7 +182,6 @@ def score(
     resume_id: int,
     resume_latex: str,
     jd: ParsedJD,
-    llm: Optional[LLMClient] = None,
     weights: Optional[dict] = None,
 ) -> ResumeScore:
     """
@@ -195,8 +195,6 @@ def score(
     Results are cached in-memory keyed by (resume_hash, jd_hash) to avoid
     repeated LLM calls when scoring the same state multiple times.
     """
-    if llm is None:
-        llm = _llm
     if weights is None:
         weights = DEFAULT_WEIGHTS
 
@@ -213,7 +211,10 @@ def score(
     resume_text = _latex_to_text(resume_latex)
 
     keyword_score, missing_keywords = _score_keyword_match(resume_text, jd)
-    llm_output = _score_llm_dimensions(llm, resume_latex, jd)
+
+    llm_output = _score_llm_dimensions(resume_latex, jd)
+    if llm_output is None:
+        raise ValueError("Scoring failed — check API keys and quotas")
 
     overall = _weighted_score(
         ats     = llm_output.ats_friendliness.score,

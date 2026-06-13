@@ -3,7 +3,7 @@ from app.models.generation import Email, CoverLetter, OutreachMessage
 from app.models.jd import ParsedJD
 from app.models.resume import ParsedResume
 
-from app.utils.llm import llm as _llm, Prompt
+from app.utils.llm import generate_for_task, Prompt
 
 _TRUTHFULNESS_GUARDRAIL = """
 ### IMPORTANT TRUTHFULNESS CONSTRAINTS:
@@ -272,10 +272,10 @@ def generate(
         no_jd=no_jd,
     )
 
-    response = _llm.generate(
+    response = generate_for_task(
+        "generation",
         Prompt(system=system_prompt, user=prompt),
-        provider="gemini",
-        response_model=model,
+        model,
     )
     if not response.schema_matched or response.parsed is None:
         raise ValueError(f"LLM response did not match {model.__name__} schema")

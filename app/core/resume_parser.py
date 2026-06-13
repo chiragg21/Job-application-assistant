@@ -7,10 +7,8 @@ from app.models.resume import (
     PersonalInfo, ResumeSection, ParsedResume,
     SectionContent, AtomicItem
 )
-import chromadb
-from chromadb.utils import embedding_functions
-
 from app.core.chroma_client import get_chroma_client
+from app.core.embeddings import get_ef
 
 from config.config import get_config_dict
 _cfg       = get_config_dict()
@@ -42,14 +40,7 @@ class ResumeParser:
     def __init__(self):
         self.db = SQLHandler()
 
-        cfg = get_config_dict()
-        vector_path = Path(cfg["path_dir"]["data_dir"]) / "vectorstore"
-        embedding_model = cfg["rag_config"]["embedding_model"]
-
-        self.ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model,
-            token=_HF_TOKEN or None,
-        )
+        self.ef = get_ef()
         self.chroma_client = get_chroma_client()
 
         self.col_resume = self.chroma_client.get_or_create_collection(

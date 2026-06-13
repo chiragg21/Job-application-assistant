@@ -1,0 +1,64 @@
+# Task → API / model assignment
+# ─────────────────────────────────────────────────────────────────────────────
+# Edit this file to change which provider and model handles each task.
+# Restart the FastAPI server after saving.
+#
+# provider: "gemini" | "groq" | "openai"
+# model:    must match an entry in ~/.infrakit/llm/quotas.json
+#
+# fallback (optional): tried automatically when the primary model is
+#   - rate-limited / quota exhausted
+#   - returns an error or schema mismatch
+#
+# Cross-provider fallback (e.g. groq → gemini) is handled internally by the
+# LLM client.  Same-provider fallback (e.g. gemini-3.5 → gemini-2.5) is
+# managed by the routing layer.
+
+[tasks.scoring]
+# ATS score + quality score — called once per session.
+# Benefits most from the best available reasoning model.
+provider = "gemini"
+model    = "gemini-3.5-flash"
+
+[tasks.scoring.fallback]
+provider = "gemini"
+model    = "gemini-2.5-flash"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tasks.analysis]
+# Initial whole-resume review — called once per editing cycle.
+# Generates suggestions for every section in a single structured call.
+provider = "gemini"
+model    = "gemini-3.5-flash"
+
+[tasks.analysis.fallback]
+provider = "gemini"
+model    = "gemini-2.5-flash"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tasks.jd_parsing]
+# Parse raw job description text into structured JSON — called once per JD.
+provider = "gemini"
+model    = "gemini-2.5-flash"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tasks.editing]
+# Per-section line edits — called many times per session.
+# No fallback configured; gemini-2.5-flash is the reliable base model.
+provider = "gemini"
+model    = "gemini-2.5-flash"
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+[tasks.generation]
+# Cover letter, email, outreach generation.
+# Groq is fastest; Gemini lite is the fallback with more daily headroom.
+provider = "groq"
+model    = "llama-3.3-70b-versatile"
+
+[tasks.generation.fallback]
+provider = "gemini"
+model    = "gemini-2.5-flash-lite"

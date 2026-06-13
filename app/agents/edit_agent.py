@@ -5,7 +5,7 @@ import json
 from typing import Optional
 from app.core.retriever import ATOMIC_SECTIONS, FLAT_SECTIONS
 from app.utils import SQLHandler, get_logger
-from app.utils.llm import llm as _llm, Prompt
+from app.utils.llm import generate_for_task, Prompt
 from app.models.edit import (
     ItemEditState, SectionEditState, ResumeEditState, ResumeEditCycle, ResumeStateNode, OneLlmOutput, WholeLlmOutput
 )
@@ -24,12 +24,10 @@ class EditAgent:
         self,
         editing_cycle: ResumeEditCycle,
         resume: ResumeEditState,
-        usellm: str = "gemini",
     ):
         self.editing_cycle = editing_cycle
         self.editing_cycle.init_root(resume)
 
-        self.llmhandler = _llm
         self.db = SQLHandler()
 
         self.section_name       = ""
@@ -163,10 +161,10 @@ If no changes are needed for an item, return empty lists for that item.
         if cached is not None:
             response = WholeLlmOutput.model_validate_json(cached)
         else:
-            result = self.llmhandler.generate(
+            result = generate_for_task(
+                "analysis",
                 Prompt(system=system_prompt, user=prompt),
-                provider="gemini",
-                response_model=WholeLlmOutput,
+                WholeLlmOutput,
             )
             if not result.schema_matched or result.parsed is None:
                 raise ValueError("LLM response did not match WholeLlmOutput schema")
@@ -269,10 +267,10 @@ If no changes are needed, return empty lists.
 ## INPUT
 {item_to_update.updated_section}
 """
-        result = self.llmhandler.generate(
+        result = generate_for_task(
+            "editing",
             Prompt(system=system_prompt, user=prompt),
-            provider="gemini",
-            response_model=OneLlmOutput,
+            OneLlmOutput,
         )
         if not result.schema_matched or result.parsed is None:
             raise ValueError("LLM response did not match OneLlmOutput schema")
@@ -384,10 +382,10 @@ If no changes are needed, return empty lists.
     {self._special_instruction(self.special_instruction)}
     """
 
-        result = self.llmhandler.generate(
+        result = generate_for_task(
+            "editing",
             Prompt(system=system_prompt, user=prompt),
-            provider="gemini",
-            response_model=OneLlmOutput,
+            OneLlmOutput,
         )
         if not result.schema_matched or result.parsed is None:
             raise ValueError("LLM response did not match OneLlmOutput schema")

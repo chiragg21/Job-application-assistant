@@ -2,8 +2,8 @@
 #
 # API key management endpoints.
 #
-#   GET    /keys/status          → live per-key metrics from llm.status()
-#   PATCH  /keys/quota           → set rpm/token limits via llm.set_quota()
+#   GET    /keys/status          → live per-key metrics (merged across all clients)
+#   PATCH  /keys/quota           → set rpm/token limits on all clients
 #   POST   /keys                 → add a key at runtime + persist to data/user_keys.json
 #   DELETE /keys/{provider}/{key_id} → remove a key at runtime + remove from persistence
 
@@ -17,7 +17,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.utils.llm import llm
+from app.utils.llm import ALL_CLIENTS, merged_status
 from app.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -55,11 +55,12 @@ def load_user_keys() -> None:
     """
     entries = _load_raw()
     for entry in entries:
-        try:
-            llm.add_key(entry["provider"], entry["key"])
-            log.info("[keys] loaded persisted key provider=%s id=%.8s…", entry["provider"], entry["key"])
-        except Exception as exc:
-            log.warning("[keys] failed to load persisted key: %s", exc)
+        for client in ALL_CLIENTS:
+            try:
+                client.add_key(entry["provider"], entry["key"])
+            except Exception as exc:
+                log.warning("[keys] failed to load persisted key into client: %s", exc)
+        log.info("[keys] loaded persisted key provider=%s id=%.8s…", entry["provider"], entry["key"])
     if entries:
         log.info("[keys] loaded %d user key(s) from disk", len(entries))
 
@@ -86,6 +87,15 @@ class AddKeyResponse(BaseModel):
     message: str
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _any_client():
+    """Return the first available client — used for operations that apply globally."""
+    if not ALL_CLIENTS:
+        raise RuntimeError("No LLM clients configured")
+    return ALL_CLIENTS[0]
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/status")
@@ -103,7 +113,7 @@ def get_key_status(provider: Optional[str] = None):
       recent_meta (last 5 request latencies / outcomes)
     """
     try:
-        return llm.status(provider=provider)
+        return merged_status(provider=provider)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -125,7 +135,8 @@ def patch_key_quota(req: QuotaPatchRequest):
             daily_token_limit=req.daily_token_limit,
             reset_hour_utc=req.reset_hour_utc,
         )
-        llm.set_quota(req.provider, req.key_id, quota)
+        for client in ALL_CLIENTS:
+            client.set_quota(req.provider, req.key_id, quota)
         log.info("[keys] quota updated provider=%s key_id=%s", req.provider, req.key_id)
         return {"updated": True}
     except Exception as exc:
@@ -149,7 +160,8 @@ def add_key(req: AddKeyRequest):
     if not req.key.strip():
         raise HTTPException(status_code=422, detail="Key must not be empty.")
     try:
-        llm.add_key(provider, req.key)
+        for client in ALL_CLIENTS:
+            client.add_key(provider, req.key)
         with _keys_lock:
             entries = _load_raw()
             if not any(e["key"] == req.key and e["provider"] == provider for e in entries):
@@ -161,6 +173,46 @@ def add_key(req: AddKeyRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.patch("/{provider}/{key_id}/toggle")
+def toggle_key(provider: str, key_id: str, active: bool = True):
+    """
+    Manually activate or deactivate a key.
+
+    Pass `?active=false` to suspend the key — it will be skipped for all
+    requests but stays registered.  Pass `?active=true` to re-enable it.
+    The key's daily token counter and model stats are left untouched.
+    """
+    from infrakit.llm.models import ModelStatus
+
+    provider = provider.lower()
+    if provider not in _VALID_PROVIDERS:
+        raise HTTPException(status_code=422, detail=f"Unknown provider: {provider}")
+
+    import time
+    found = False
+    for client in ALL_CLIENTS:
+        km = client._km  # type: ignore[attr-defined]
+        with km._lock:  # type: ignore[attr-defined]
+            ks = next((k for k in km._states.get(provider, []) if k.key_id == key_id), None)
+            if ks is None:
+                continue
+            found = True
+            for ms in ks.model_states.values():
+                if active:
+                    ms.status = ModelStatus.ACTIVE
+                    ms.deactivated_at = None
+                else:
+                    ms.status = ModelStatus.INACTIVE
+                    ms.deactivated_at = time.time()
+            km._persist()  # type: ignore[attr-defined]
+
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Key '{key_id}' not found for provider '{provider}'.")
+
+    log.info("[keys] toggle provider=%s key_id=%s active=%s", provider, key_id, active)
+    return {"active": active, "key_id": key_id}
+
+
 @router.delete("/{provider}/{key_id}")
 def remove_key(provider: str, key_id: str):
     """
@@ -170,7 +222,8 @@ def remove_key(provider: str, key_id: str):
     The key is deregistered immediately and removed from the persistence file.
     """
     try:
-        llm.remove_key(provider, key_id)
+        for client in ALL_CLIENTS:
+            client.remove_key(provider, key_id)
         with _keys_lock:
             entries = _load_raw()
             before  = len(entries)

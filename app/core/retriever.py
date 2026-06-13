@@ -2,7 +2,7 @@ import json
 import os
 import chromadb
 from chromadb import Collection as ChromaCollection
-from chromadb.utils import embedding_functions
+from app.core.embeddings import get_ef
 from typing import Any, List
 
 from app.core.chroma_client import get_chroma_client
@@ -49,11 +49,7 @@ class ResumeRetriever:
 
         self.db = SQLHandler()
         self._chroma_client = get_chroma_client()
-        # Use same EF as resume_parser / jd_parser so query embeddings are consistent
-        self._ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBEDDING_MODEL,
-            token=HF_TOKEN or None,
-        )
+        self._ef = get_ef()
         self.col_resume: ChromaCollection = self._chroma_client.get_or_create_collection(
             name              = resume_col,
             embedding_function= self._ef,

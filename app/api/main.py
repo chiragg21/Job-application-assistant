@@ -19,19 +19,13 @@ log = get_logger(__name__)
 
 def _prewarm_embeddings() -> None:
     """
-    Instantiate all pipeline singletons and run a dummy embed so the
-    420 MB sentence-transformer model is loaded before the first real
-    request arrives.  Runs in a thread-pool executor to avoid blocking
+    Load the sentence-transformer weights once at startup so the first real
+    request is not delayed.  Runs in a thread-pool executor to avoid blocking
     the event loop.
     """
     try:
-        from app.core.pipeline import _get_jd_parser, _get_resume_parser, _get_retriever
-        jd_parser     = _get_jd_parser()
-        resume_parser = _get_resume_parser()
-        _get_retriever()
-        # Trigger actual model weights load via a no-op embed call
-        resume_parser.ef(["warmup"])
-        jd_parser.ef(["warmup"])
+        from app.core.embeddings import prewarm
+        prewarm()
         log.info("[startup] embedding model pre-warmed")
     except Exception as exc:
         log.warning("[startup] embedding pre-warm failed (non-fatal): %s", exc)
