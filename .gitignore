@@ -42,6 +42,11 @@ desktop.ini
 *.swp
 *.swo
 
+# ── Test / CI artefacts ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
 # ── Temp / scratch ────────────────────────────────────────────────────────────
 *.tmp
 *.bak

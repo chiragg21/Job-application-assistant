@@ -116,18 +116,26 @@ def try_compile_latex(latex: str) -> bytes | None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tex = Path(tmpdir) / "resume.tex"
             tex.write_text(latex, encoding="utf-8")
-            for _ in range(2):
-                subprocess.run(
-                    ["pdflatex", "-interaction=nonstopmode",
-                     "-output-directory", tmpdir, str(tex)],
-                    capture_output=True, timeout=30,
-                )
+            subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode",
+                 "-output-directory", tmpdir, str(tex)],
+                capture_output=True, timeout=30,
+            )
             pdf = Path(tmpdir) / "resume.pdf"
             if pdf.exists():
                 return pdf.read_bytes()
     except Exception:
         pass
     return None
+
+
+@st.cache_data(show_spinner=False)
+def _compile_latex_cached(latex: str) -> bytes | None:
+    """
+    Cached wrapper around try_compile_latex.
+    Streamlit hashes `latex` as the cache key — identical LaTeX skips pdflatex entirely.
+    """
+    return try_compile_latex(latex)
 
 
 def pdf_to_png(pdf_bytes: bytes, dpi: int = 150) -> bytes | None:
@@ -141,7 +149,7 @@ def pdf_to_png(pdf_bytes: bytes, dpi: int = 150) -> bytes | None:
 
 
 def latex_to_png(latex: str, dpi: int = 150) -> bytes | None:
-    pdf = try_compile_latex(latex)
+    pdf = _compile_latex_cached(latex)
     return pdf_to_png(pdf, dpi=dpi) if pdf else None
 
 
@@ -891,11 +899,29 @@ elif interrupt and interrupt.get("type") == "section_review":
     current    = interrupt.get("current_latex", "")
     lines      = interrupt.get("lines_to_change", [])
     changes    = interrupt.get("suggested_changes", [])
-    proposed   = build_proposed(current, lines, changes)
     can_back   = interrupt.get("can_go_back", False)
     sec_idx    = interrupt.get("section_index", 0)
     total_secs = interrupt.get("total_sections", 1)
     history    = interrupt.get("history", [])   # [{node_id, action, content}, ...]
+
+    # _wkey scopes all widget keys to this section+history snapshot so that
+    # widgets reset automatically when a new LLM result arrives.
+    _wkey = f"{sec_idx}_{len(history)}"
+
+    # Read which individual changes the user has checked (default: all selected).
+    # We read from session_state here — before the checkboxes are rendered —
+    # so that the proposed preview below already reflects the current selection.
+    selected_indices = [
+        i for i in range(len(lines))
+        if st.session_state.get(f"change_{_wkey}_{i}", True)
+    ]
+
+    # Build proposed preview using only the currently selected changes.
+    proposed = build_proposed(
+        current,
+        [lines[i] for i in selected_indices],
+        [changes[i] for i in selected_indices],
+    )
 
     heading = f"Review: **{section}**" + (f"  —  {item}" if item else "")
 
@@ -983,16 +1009,27 @@ elif interrupt and interrupt.get("type") == "section_review":
         else:
             st.info("No changes suggested for this section.")
 
-    # ── Diff table ─────────────────────────────────────────────────────────
+    # ── Diff table with per-change checkboxes ─────────────────────────────
     if lines:
-        with st.expander("Line-by-line diff", expanded=True):
-            hdr1, hdr2 = st.columns(2)
-            hdr1.markdown("**Before**")
-            hdr2.markdown("**After**")
-            for old_l, new_l in zip(lines, changes):
-                c1, c2 = st.columns(2)
-                c1.markdown(f'<div class="diff-old">{old_l}</div>', unsafe_allow_html=True)
-                c2.markdown(f'<div class="diff-new">{new_l}</div>', unsafe_allow_html=True)
+        st.markdown("#### Suggested Changes — check the ones to apply")
+        st.caption(f"{len(selected_indices)} of {len(lines)} changes selected")
+        hdr0, hdr1, hdr2 = st.columns([0.5, 3, 3])
+        hdr0.markdown("**Apply?**")
+        hdr1.markdown("**Before**")
+        hdr2.markdown("**After**")
+        for i, (old_l, new_l) in enumerate(zip(lines, changes)):
+            c0, c1, c2 = st.columns([0.5, 3, 3])
+            with c0:
+                st.checkbox(
+                    "",
+                    value=True,
+                    key=f"change_{_wkey}_{i}",
+                    label_visibility="collapsed",
+                )
+            with c1:
+                st.markdown(f'<div class="diff-old">{old_l}</div>', unsafe_allow_html=True)
+            with c2:
+                st.markdown(f'<div class="diff-new">{new_l}</div>', unsafe_allow_html=True)
     else:
         st.info("No specific line suggestions — accept keeps the current version.")
 
@@ -1012,10 +1049,6 @@ elif interrupt and interrupt.get("type") == "section_review":
     options = ["accept", "reject", "paraphrase", "custom_instruction"]
     if has_prior_llm_edit:
         options.append("another_suggestion")
-
-    # Keys include len(history) so widgets reset to defaults whenever a new
-    # LLM result arrives (history grows), without requiring manual clearing.
-    _wkey = f"{sec_idx}_{len(history)}"
 
     action = st.radio(
         "Action",
@@ -1055,12 +1088,18 @@ elif interrupt and interrupt.get("type") == "section_review":
     col_submit, col_back = st.columns([3, 1])
     with col_submit:
         if st.button("Submit →", type="primary", use_container_width=True):
+            response: dict = {
+                "proposal":            action,
+                "special_instruction": special_instruction,
+                "rejection_reason":    rejection_reason,
+            }
+            # For accept, tell the graph exactly which changes to apply.
+            # Omit the key entirely when all changes are selected (full accept)
+            # so the graph takes the fast path with no rebuild.
+            if action == "accept" and lines and len(selected_indices) < len(lines):
+                response["selected_indices"] = selected_indices
             with st.spinner("Applying edit…"):
-                send_resume({
-                    "proposal":            action,
-                    "special_instruction": special_instruction,
-                    "rejection_reason":    rejection_reason,
-                })
+                send_resume(response)
     with col_back:
         if st.button(
             "← Previous section",
@@ -1158,7 +1197,7 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
                     file_name=f"{_base}.tex", mime="text/plain",
                 )
             with col_dl2:
-                pdf_bytes = try_compile_latex(latex)
+                pdf_bytes = _compile_latex_cached(latex)
                 if pdf_bytes:
                     st.download_button(
                         "⬇️ Download .pdf", data=pdf_bytes,
@@ -1266,7 +1305,7 @@ elif interrupt and interrupt.get("type") == "refine_or_finish":
                     key="lo_dl_tex",
                 )
             with _lo_dl_col2:
-                _lo_pdf = try_compile_latex(_lo_latex)
+                _lo_pdf = _compile_latex_cached(_lo_latex)
                 if _lo_pdf:
                     st.download_button(
                         "⬇️ Download .pdf", data=_lo_pdf,
@@ -1339,7 +1378,7 @@ elif not interrupt and thread_id:
                     "⬇️ Download .tex", data=latex,
                     file_name=f"{_done_base}.tex", mime="text/plain",
                 )
-                pdf_bytes = try_compile_latex(latex)
+                pdf_bytes = _compile_latex_cached(latex)
                 if pdf_bytes:
                     st.download_button(
                         "⬇️ Download .pdf", data=pdf_bytes,

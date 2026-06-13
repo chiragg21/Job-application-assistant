@@ -5,6 +5,7 @@
 # Start with:
 #   uv run uvicorn app.api.main:app --reload
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -16,9 +17,33 @@ from app.utils import get_logger
 log = get_logger(__name__)
 
 
+def _prewarm_embeddings() -> None:
+    """
+    Instantiate all pipeline singletons and run a dummy embed so the
+    420 MB sentence-transformer model is loaded before the first real
+    request arrives.  Runs in a thread-pool executor to avoid blocking
+    the event loop.
+    """
+    try:
+        from app.core.pipeline import _get_jd_parser, _get_resume_parser, _get_retriever
+        jd_parser     = _get_jd_parser()
+        resume_parser = _get_resume_parser()
+        _get_retriever()
+        # Trigger actual model weights load via a no-op embed call
+        resume_parser.ef(["warmup"])
+        jd_parser.ef(["warmup"])
+        log.info("[startup] embedding model pre-warmed")
+    except Exception as exc:
+        log.warning("[startup] embedding pre-warm failed (non-fatal): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Job-Assistant API starting up")
+    from app.graph.edit_graph import evict_old_threads
+    evict_old_threads()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _prewarm_embeddings)
     yield
     log.info("Job-Assistant API shutting down")
 

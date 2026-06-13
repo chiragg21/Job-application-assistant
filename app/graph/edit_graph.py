@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import time
 import traceback
 import concurrent.futures
 from typing import Any
@@ -423,7 +424,61 @@ def node_apply_edit(state: EditGraphState) -> dict:
 
         # ── accept ────────────────────────────────────────────────────────
         if proposal == "accept":
-            # Suggestion already in cycle — nothing to change.
+            selected_indices = review.get("selected_indices")  # None = all selected
+            if selected_indices is not None:
+                # Partial accept — rebuild the section from its pre-suggestion
+                # state, applying only the lines the user checked.
+                from app.models.edit import SectionEditState, ItemEditState
+                agent     = _rebuild_agent(state)
+                cycle     = agent.editing_cycle
+                sec_name  = review["section"]
+                item_name = review.get("item")
+
+                if item_name:
+                    _, obj = cycle.current_state.get_item(sec_name, item_name)
+                else:
+                    obj = cycle.current_state.get_section(sec_name)
+
+                if obj:
+                    all_lines  = obj.lines_to_change
+                    all_sugg   = obj.suggested_changes
+                    kept_lines = [all_lines[i] for i in selected_indices if i < len(all_lines)]
+                    kept_sugg  = [all_sugg[i]  for i in selected_indices if i < len(all_sugg)]
+
+                    new_content = obj.section_previous_state
+                    for orig, repl in zip(kept_lines, kept_sugg):
+                        new_content = new_content.replace(orig, repl)
+
+                    if item_name:
+                        updated = ItemEditState(
+                            section_name=sec_name,
+                            item_name=item_name,
+                            section_previous_state=obj.section_previous_state,
+                            lines_to_change=kept_lines,
+                            suggested_changes=kept_sugg,
+                            updated_section=new_content,
+                        )
+                        cur_items = list(getattr(cycle.current_state, sec_name) or [])
+                        new_items = [updated if (it and it.item_name == item_name) else it for it in cur_items]
+                        new_state = cycle.current_state.model_copy(update={sec_name: new_items})
+                    else:
+                        updated = SectionEditState(
+                            section_name=sec_name,
+                            section_previous_state=obj.section_previous_state,
+                            lines_to_change=kept_lines,
+                            suggested_changes=kept_sugg,
+                            updated_section=new_content,
+                        )
+                        new_state = cycle.current_state.set_section(sec_name, updated)
+
+                    cycle.push(new_state, action="partial_accept", section_name=sec_name)
+                    return {
+                        "edit_cycle_dict":   _serialise_cycle(agent),
+                        "sections_reviewed": reviewed + [current_section],
+                        "stage": "edit_applied",
+                    }
+
+            # Full accept — all changes already applied in cycle, nothing to rebuild.
             return {
                 "sections_reviewed": reviewed + [current_section],
                 "stage": "edit_applied",
@@ -591,3 +646,31 @@ def build_edit_graph() -> StateGraph:
 
 _checkpointer = MemorySaver()
 edit_graph    = build_edit_graph().compile(checkpointer=_checkpointer, interrupt_before=[])
+
+# ======================================================================
+# Thread TTL tracking — evict sessions older than _TTL_SECONDS to
+# prevent MemorySaver from growing unbounded over long uptime.
+# ======================================================================
+
+_TTL_SECONDS = 24 * 3600  # 24 hours
+_thread_timestamps: dict[str, float] = {}
+
+
+def register_thread(thread_id: str) -> None:
+    """Record creation time for a new session thread."""
+    _thread_timestamps[thread_id] = time.time()
+
+
+def evict_old_threads() -> None:
+    """Remove threads older than _TTL_SECONDS from MemorySaver storage."""
+    cutoff  = time.time() - _TTL_SECONDS
+    expired = [tid for tid, ts in _thread_timestamps.items() if ts < cutoff]
+    for tid in expired:
+        try:
+            if hasattr(_checkpointer, "storage") and tid in _checkpointer.storage:
+                del _checkpointer.storage[tid]
+        except Exception:
+            pass
+        del _thread_timestamps[tid]
+    if expired:
+        log.info("[edit_graph] evicted %d expired thread(s)", len(expired))

@@ -23,10 +23,13 @@ An AI-powered resume tailoring and job application assistant. Upload your resume
 
 ### Interactive Editing Session (LangGraph)
 - Section-by-section AI edit suggestions with side-by-side diff view
-- Actions per section: **Accept**, **Reject**, **Paraphrase**, **Custom instruction**, **Another suggestion**
-- Full edit history per section with one-click restore to any previous version
+- LLM returns **all improvable lines** per section (not just the most obvious one), giving more comprehensive suggestions per call
+- **Per-change selection** — each suggested line change has its own checkbox; accept the ones you want and skip the rest rather than accepting or rejecting the whole section at once. The side-by-side preview updates live to reflect your selection
+- Actions per section: **Accept** (all or selected changes), **Reject**, **Paraphrase**, **Custom instruction**, **Another suggestion**
+- Full edit history per section with one-click restore to any previous version (including partial-accept snapshots)
 - Back-navigation to re-review previous sections
 - Multi-cycle support: after reviewing all sections the system scores the result, then offers a **Refine** pass (re-runs LLM with score feedback) or **Finish**
+- LLM suggestions use `\textbf{}` only inside experience and project bullet points — never in the skills section, where bolding adds no value
 
 ### Resume Scoring
 - Three dimensions: **Keyword Match** (coverage + embedding similarity), **ATS Friendliness** (LLM), **Resume Quality** (LLM)
@@ -39,6 +42,8 @@ An AI-powered resume tailoring and job application assistant. Upload your resume
   - **Quick Generate (post-parse)** — after JD is parsed and sections are retrieved, generate without entering the edit loop
   - **Session Generate** — generate using the tailored resume from an active editing session
   - **Post-session Generate** — generate after finishing the editing session
+- All document types are generated **in parallel** (ThreadPoolExecutor) — requesting Cover Letter + Email + Outreach together takes no longer than the slowest single generation
+- **Generation cache** — results are cached in SQLite keyed by a hash of `(JD, resume, type, instruction, no_jd)`. Generating Email first and then requesting all three skips the Email LLM call entirely and only generates the remaining two
 
 ### Live Resume Layout Customisation
 - Available at the end of an editing session (Refine / Finish screen)
@@ -48,6 +53,20 @@ An AI-powered resume tailoring and job application assistant. Upload your resume
 ### Full LaTeX Preview
 - Compile the resume to PDF at any point during or after editing
 - Rendered as a PNG image in the browser; falls back to syntax-highlighted LaTeX source if `pdflatex` is not installed
+- **Compile cache** — identical LaTeX is never sent to `pdflatex` twice in the same session; compilation results are cached by content hash via `@st.cache_data`
+
+### Performance & Caching
+
+All expensive operations are cached to minimise repeated LLM and compute calls:
+
+| Layer | Cache type | Key |
+|---|---|---|
+| Document generation | SQLite (persistent, cross-session) | SHA-256 of `(JD, resume, type, instruction, no_jd)` |
+| Resume scoring | In-memory LRU (64 entries) | SHA-256 of `(resume_latex, jd)` |
+| Sentence-transformer embeddings | `functools.lru_cache` (256 entries) | Embedding input text |
+| ChromaDB retrieval | In-memory dict (process lifetime) | `(job_id, sorted resume_ids)` |
+| LaTeX → PDF compilation | Streamlit `@st.cache_data` | Full LaTeX string |
+| JD parsing | SQLite (via raw + parsed content hash) | Built into `JDParser.run()` |
 
 ---
 
@@ -179,23 +198,31 @@ job-assistant/
 │   │   ├── edit_graph.py     # LangGraph StateGraph for the editing session:
 │   │   │                     #   node_parse_and_retrieve → item_selection interrupt
 │   │   │                     #   → node_build_edit_state → node_suggest
-│   │   │                     #   → section_review interrupt (per section)
+│   │   │                     #   → section_review interrupt (per section, per change)
 │   │   │                     #   → refine_or_finish interrupt → done
-│   │   ├── generation_graph.py  # (optional) LangGraph for generation flow
-│   │   └── state.py          # EditGraphState TypedDict
+│   │   ├── generation_graph.py  # LangGraph for batch document generation;
+│   │   │                     #   runs all requested types in parallel via
+│   │   │                     #   ThreadPoolExecutor, no human-in-the-loop
+│   │   └── state.py          # EditGraphState + GenerationGraphState TypedDicts
 │   │
 │   ├── agents/
 │   │   ├── edit_agent.py     # EditAgent — holds ResumeEditCycle, calls LLM for
-│   │   │                     #   suggestions and section edits, manages history tree
-│   │   ├── score_agent.py    # score() — keyword coverage + semantic + LLM scoring
-│   │   ├── generator_agent.py# generate() — cover letter / email / outreach via LLM
+│   │   │                     #   suggestions (all improvable lines per section) and
+│   │   │                     #   section edits, manages history tree
+│   │   ├── score_agent.py    # score() — keyword coverage + semantic + LLM scoring;
+│   │   │                     #   lru_cache on embeddings, in-memory score result cache
+│   │   ├── generator_agent.py# generate() — cover letter / email / outreach via LLM;
+│   │   │                     #   checks generation cache before every LLM call
 │   │   └── orchestrator.py   # High-level orchestration helpers
 │   │
 │   ├── core/
 │   │   ├── pipeline.py       # Thin facade over all core modules — the single
-│   │   │                     #   import used by graph nodes and API routes
+│   │   │                     #   import used by graph nodes and API routes;
+│   │   │                     #   includes in-memory retrieval cache
+│   │   ├── gen_cache.py      # SQLite-backed generation result cache;
+│   │   │                     #   make_key() + get() + set() used by generator_agent
 │   │   ├── jd_parser.py      # JDParser — LLM extracts structured JD, saves to
-│   │   │                     #   SQLite + embeds to ChromaDB
+│   │   │                     #   SQLite + embeds to ChromaDB; hash-based dedup
 │   │   ├── resume_parser.py  # ResumeParser — LLM extracts structured resume,
 │   │   │                     #   saves sections/items to SQLite + ChromaDB
 │   │   ├── retriever.py      # ResumeRetriever — ChromaDB queries, two-stage

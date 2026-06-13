@@ -1,5 +1,8 @@
 # src/agents/score_agent.py
 import re
+import json
+import hashlib
+import functools
 import numpy as np
 from typing import Optional
 from infrakit.llm import LLMClient
@@ -19,6 +22,16 @@ _ef = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name=config.get('rag_config', {}).get('embedding_model', 'all-mpnet-base-v2')
 )
 
+# In-memory score result cache — keyed by (resume_hash, jd_hash).
+# Avoids re-scoring the same resume+JD when the user views the score page
+# multiple times or when the server hasn't restarted.
+_score_cache: dict[tuple[str, str], ResumeScore] = {}
+_SCORE_CACHE_MAX = 64
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
 # Weights for composite score — override in config.ini if needed
 DEFAULT_WEIGHTS = config.get('score_weights', {
     'ats_friendliness': 0.35,
@@ -35,8 +48,10 @@ def _latex_to_text(latex: str) -> str:
     return text.strip()
 
 
-def _get_embedding(text: str) -> np.ndarray:
-    return np.array(_ef([text])[0])
+@functools.lru_cache(maxsize=256)
+def _get_embedding(text: str) -> tuple:
+    """Cache embeddings by text content — avoids recomputing for the same JD or resume."""
+    return tuple(_ef([text])[0])
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -83,8 +98,8 @@ def _score_keyword_match(resume_text: str, jd: ParsedJD) -> tuple[float, list[st
         " ".join(jd.responsibilities or []),
         " ".join(jd.nice_to_have_skills or []),
     ])
-    resume_emb    = _get_embedding(resume_text)
-    jd_emb        = _get_embedding(jd_text)
+    resume_emb    = np.array(_get_embedding(resume_text))
+    jd_emb        = np.array(_get_embedding(jd_text))
     semantic      = _cosine_similarity(resume_emb, jd_emb) * 100
 
     score = round(0.6 * coverage + 0.4 * semantic, 2)
@@ -120,16 +135,16 @@ For each dimension provide a score, clear reasoning, and 2-3 specific improvemen
 Also provide a short overall_feedback paragraph.
 
 ## JD CONTEXT
-Required Skills: {jd.required_skills}
-Responsibilities: {jd.responsibilities}
+Required Skills: {jd.required_skills[:10]}
+Responsibilities: {jd.responsibilities[:5]}
+
+## OUTPUT FORMAT (JSON only, no markdown):
+{LLMScoreOutput.model_json_schema()}
 """
 
     prompt = f"""
 ## RESUME (LaTeX):
 {resume_latex}
-
-## OUTPUT FORMAT (JSON only, no markdown):
-{LLMScoreOutput.model_json_schema()}
 """
     return system_prompt, prompt
 
@@ -177,12 +192,24 @@ def score(
     3. resume_quality   — LLM judges impact, clarity, quantification (JD-agnostic)
 
     Produces a ResumeScore with per-dimension breakdowns and actionable suggestions.
+    Results are cached in-memory keyed by (resume_hash, jd_hash) to avoid
+    repeated LLM calls when scoring the same state multiple times.
     """
     if llm is None:
         llm = _llm
     if weights is None:
         weights = DEFAULT_WEIGHTS
 
+    # ── Cache check ────────────────────────────────────────────────────────
+    jd_hash     = _content_hash(json.dumps(jd.model_dump(), sort_keys=True))
+    resume_hash = _content_hash(resume_latex)
+    cache_key   = (resume_hash, jd_hash)
+
+    if cache_key in _score_cache:
+        logger.info("[score_agent] cache hit — skipping LLM call")
+        return _score_cache[cache_key]
+
+    # ── Compute ────────────────────────────────────────────────────────────
     resume_text = _latex_to_text(resume_latex)
 
     keyword_score, missing_keywords = _score_keyword_match(resume_text, jd)
@@ -218,4 +245,10 @@ def score(
     )
 
     logger.info(f"[ScoreAgent] Overall score={overall} | app_id={app_id}")
+
+    # ── Store in cache (evict oldest entry when full) ──────────────────────
+    if len(_score_cache) >= _SCORE_CACHE_MAX:
+        _score_cache.pop(next(iter(_score_cache)))
+    _score_cache[cache_key] = result
+
     return result

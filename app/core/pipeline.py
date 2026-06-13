@@ -1,6 +1,7 @@
 # pipeline.py
 
 from pathlib import Path
+import threading
 
 from config.config import get_config_dict
 from app.utils import SQLHandler, get_logger
@@ -27,9 +28,15 @@ retriever_config = config['retriever_config']
 # Lazy singletons — instantiated on first use to avoid import-time side-effects
 # ------------------------------------------------------------------
 
-_jd_parser:     JDParser | None      = None
-_resume_parser: ResumeParser | None  = None
+_jd_parser:     JDParser | None        = None
+_resume_parser: ResumeParser | None    = None
 _retriever:     ResumeRetriever | None = None
+
+# In-memory retrieval cache keyed by (job_id, sorted resume_ids tuple).
+# ChromaDB queries for the same JD+resumes are deterministic — no need to
+# re-query until new resume data is added.
+_retrieval_cache:      dict[tuple, list] = {}
+_retrieval_cache_lock: threading.Lock    = threading.Lock()
 
 
 def _get_jd_parser() -> JDParser:
@@ -224,14 +231,25 @@ def retrieve(
     resume_ids — if supplied, only sections from those resumes are searched.
     Pass the result of get_user_resume_ids(user_id) to scope retrieval to one
     user's history while still picking the most JD-relevant version.
+    Results are cached in-memory: same job_id + resume_ids → skip ChromaDB query.
     """
+    cache_key = (job_id, tuple(sorted(resume_ids)) if resume_ids else None)
+    with _retrieval_cache_lock:
+        if cache_key in _retrieval_cache:
+            log.info("retrieve: cache hit job_id=%s resumes=%s", job_id, resume_ids)
+            return _retrieval_cache[cache_key]
+
     r = _get_retriever()
     r.top_k        = top_k
     r.fetch_mult   = fetch_mult
     r.weight_skill = w_skills
     r.weight_resp  = w_resp
     r.weight_nth   = w_nth
-    return r.run(job_id=job_id, jd_obj=parsed_jd, resume_ids=resume_ids)
+    result = r.run(job_id=job_id, jd_obj=parsed_jd, resume_ids=resume_ids)
+
+    with _retrieval_cache_lock:
+        _retrieval_cache[cache_key] = result
+    return result
 
 
 def rank_and_filter(

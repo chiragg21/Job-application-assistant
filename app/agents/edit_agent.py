@@ -1,7 +1,7 @@
 # src/agents/edit_agent.py
 
-from os import system
-from random import setstate
+import hashlib
+import json
 from typing import Optional
 from app.core.retriever import ATOMIC_SECTIONS, FLAT_SECTIONS
 from app.utils import SQLHandler, get_logger
@@ -10,6 +10,7 @@ from app.models.edit import (
     ItemEditState, SectionEditState, ResumeEditState, ResumeEditCycle, ResumeStateNode, OneLlmOutput, WholeLlmOutput
 )
 from app.models.jd import ParsedJD
+from app.core.gen_cache import suggestions_cache
 from config.config import get_config_dict
 
 resume_config = get_config_dict()['resume_defaults']
@@ -47,7 +48,7 @@ class EditAgent:
     - Keep sentence length roughly similar.
     - Maintain valid LaTeX syntax and formatting.
     - Preserve bullets and commands (e.g., \\item, \\textbf{}).
-    - Emphasize important technical keywords with \\textbf{} only if helpful.
+    - Use \\textbf{} only inside experience or project bullet points to highlight a key achievement or metric. Never add \\textbf{} to the skills section — skills are already listed as keywords and bolding them adds no value.
     - If no improvement is needed, return empty lists.
     - Output must strictly follow the JSON schema.
     """
@@ -62,18 +63,17 @@ class EditAgent:
 
     def _jd_context(self) -> str:
         jd = self.editing_cycle.jd
+        req   = jd.required_skills[:10]
+        resp  = jd.responsibilities[:5]
         return f"""
     ## JOB DESCRIPTION CONTEXT
-    Use only for wording alignment. Do not add missing skills.
+    Align wording with these — do not invent skills or experience that are absent.
 
-    Required Skills:
-    {jd.required_skills}
+    Required Skills (top 10):
+    {req}
 
-    Responsibilities:
-    {jd.responsibilities}
-
-    Nice to Have:
-    {jd.nice_to_have_skills}
+    Key Responsibilities (top 5):
+    {resp}
     """
     # ------------------------------------------------------------------
     # Actions
@@ -93,24 +93,44 @@ class EditAgent:
                     continue
                 input_str += item.item_name + ": " + item.updated_section + "\n"
         system_prompt = f"""
-You are an expert technical resume editor.
+You are an expert technical resume writer specialising in software engineering and data/ML roles.
 
-Improve wording of sentences in a LaTeX resume section so it will better aligns with Job description.
+Your task is to rewrite resume bullets so they pass ATS filters AND impress human reviewers.
 
-Allowed:
-- Improve clarity, grammar, and phrasing
-- Slightly strengthen impact
-- Highlight important technical terms
+## REWRITING RULES (apply in this order)
 
-Not allowed:
-- Invent skills, tools, or achievements
-- Change factual meaning
+1. **Lead with impact** — put the outcome or metric first, not the action.
+   Weak:  "Developed a pipeline that reduced training time"
+   Strong: "Cut model training time 40 % by redesigning the data pipeline"
 
-Only suggest edits for lines that can be improved.
+2. **Use the X → Y → Z formula where data permits**
+   "Achieved [result] by [action] using [method/tool]"
+   Only use real numbers from the original line. Never invent metrics.
+
+3. **Mirror JD keywords naturally** — if the JD says "MLOps" and the resume says
+   "model deployment workflows", rewrite to include "MLOps". Do not force-fit every keyword.
+
+4. **Action verb upgrade** — replace weak openers (Worked on, Helped, Assisted, Was responsible for)
+   with strong verbs (Engineered, Designed, Reduced, Automated, Deployed, Led).
+
+5. **Trim filler** — remove phrases like "successfully", "various", "multiple", "as part of a team"
+   unless they add meaning.
+
+6. **LaTeX hygiene** — preserve all commands (\\item, \\textbf{{}}, \\href{{}}{{}}). Use \\textbf{{}}
+   only inside experience/project bullets to highlight one key metric or tool per bullet.
+   Never bold items in the skills section.
+
+## HARD CONSTRAINTS
+- Do NOT invent tools, companies, metrics, or responsibilities.
+- Do NOT change factual meaning.
+- Only return lines that genuinely improve — empty lists are fine.
 
 {self._jd_context()}
 
 {self._prompt_guardrails()}
+
+## OUTPUT SCHEMA
+{WholeLlmOutput.model_json_schema()}
 """
         prompt = f"""
 ## TASK
@@ -121,25 +141,33 @@ For atomic sections (experience, projects) return one OneLlmOutput per item with
 `name` set to EXACTLY the item name shown in the input (e.g. "GIST Impact", "Job Assistant").
 Return one entry per item even when no changes are needed (use empty lists in that case).
 
-Modify only lines that can be improved.
+Identify ALL lines worth improving per section — return every line that can be meaningfully improved, not just the most obvious one.
 Return the exact original lines and their replacements.
 
 If no changes are needed for an item, return empty lists for that item.
 
 ## INPUT
 {input_str}
-
-## OUTPUT SCHEMA
-{WholeLlmOutput.model_json_schema()}
 """
-        result = self.llmhandler.generate(
-            Prompt(system=system_prompt, user=prompt),
-            provider="gemini",
-            response_model=WholeLlmOutput,
-        )
-        if not result.schema_matched or result.parsed is None:
-            raise ValueError("LLM response did not match WholeLlmOutput schema")
-        response: WholeLlmOutput = result.parsed
+        jd = self.editing_cycle.jd
+        jd_hash   = hashlib.sha256(
+            json.dumps(jd.model_dump(), sort_keys=True).encode()
+        ).hexdigest()[:16]
+        cache_key = suggestions_cache.make_key(input_str, jd_hash)
+        cached    = suggestions_cache.get(cache_key)
+
+        if cached is not None:
+            response = WholeLlmOutput.model_validate_json(cached)
+        else:
+            result = self.llmhandler.generate(
+                Prompt(system=system_prompt, user=prompt),
+                provider="gemini",
+                response_model=WholeLlmOutput,
+            )
+            if not result.schema_matched or result.parsed is None:
+                raise ValueError("LLM response did not match WholeLlmOutput schema")
+            response: WholeLlmOutput = result.parsed
+            suggestions_cache.set(cache_key, response.model_dump_json())
 
         next_resume_state = ResumeEditState()
         for sec in FLAT_SECTIONS:
@@ -200,24 +228,28 @@ If no changes are needed for an item, return empty lists for that item.
             raise ValueError(f"Section '{self.section_name}' not found in resume state.")
         
         system_prompt = f"""
-You are an expert technical resume editor.
+You are an expert technical resume writer.
 
-Improve wording of sentences in a LaTeX resume section while keeping meaning unchanged.
+Rewrite the given LaTeX resume section to maximise impact and ATS relevance.
 
-Allowed:
-- Improve clarity, grammar, and phrasing
-- Slightly strengthen impact
-- Highlight important technical terms
+Apply these techniques:
+- Lead bullets with a metric or outcome rather than the action ("Cut X by Y" not "Worked on reducing X")
+- Replace weak openers (Worked on, Helped, Was responsible for) with strong action verbs
+- Naturally incorporate relevant JD keywords where they fit without forcing them
+- Remove filler words (successfully, various, multiple)
+- Use \\textbf{{}} for one key metric or tool per bullet in experience/project sections only
 
-Not allowed:
-- Invent skills, tools, or achievements
-- Change factual meaning
-
-Only suggest edits for lines that can be improved.
+Hard constraints:
+- Do NOT invent tools, metrics, companies, or responsibilities
+- Do NOT change factual meaning
+- Preserve all LaTeX commands
 
 {self._jd_context()}
 
 {self._prompt_guardrails()}
+
+## OUTPUT SCHEMA
+{OneLlmOutput.model_json_schema()}
 """
         prompt = f"""
 {self.special_instruction}
@@ -232,9 +264,6 @@ If no changes are needed, return empty lists.
 
 ## INPUT
 {item_to_update.updated_section}
-
-## OUTPUT SCHEMA
-{OneLlmOutput.model_json_schema()}
 """
         result = self.llmhandler.generate(
             Prompt(system=system_prompt, user=prompt),
@@ -318,7 +347,7 @@ If no changes are needed, return empty lists.
     Allowed:
     - Improve clarity, grammar, and phrasing
     - Slightly strengthen impact
-    - Highlight important technical terms with \\textbf{{}} if helpful
+    - Highlight important technical terms with \\textbf{{}} only in experience/project bullet points, never in the skills section
 
     Not allowed:
     - Invent skills, tools, or achievements
@@ -328,6 +357,9 @@ If no changes are needed, return empty lists.
     {self._jd_context()}
 
     {self._prompt_guardrails()}
+
+    ## OUTPUT SCHEMA
+    {OneLlmOutput.model_json_schema()}
     """
 
         prompt = f"""
@@ -346,9 +378,6 @@ If no changes are needed, return empty lists.
     {rejection_str}
 
     {self._special_instruction(self.special_instruction)}
-
-    ## OUTPUT SCHEMA
-    {OneLlmOutput.model_json_schema()}
     """
 
         result = self.llmhandler.generate(

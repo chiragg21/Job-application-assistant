@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 import uuid
+import concurrent.futures
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, model_validator
 
 from langgraph.types import Command
 
-from app.graph.edit_graph import edit_graph, _rebuild_agent, _checkpointer
+from app.graph.edit_graph import edit_graph, _rebuild_agent, _checkpointer, register_thread
 from app.models.jd import ParsedJD
 from app.models.resume import ParsedResume
 from app.agents.generator_agent import generate as _generate_fn
@@ -28,6 +29,49 @@ from app.utils import get_logger
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/edit", tags=["Edit Session"])
+
+
+# ======================================================================
+# Shared parallel generation helper
+# ======================================================================
+
+def _run_generation_parallel(
+    gen_types: list[str],
+    resume,
+    jd,
+    custom_instruction: str | None,
+    no_jd: bool,
+) -> tuple[dict, list[str]]:
+    """
+    Dispatch each generation type to a thread pool.
+    Returns (results_dict, errors_list).
+
+    Because _generate_fn checks the generation cache first, types that
+    were already generated (same inputs) return instantly from cache —
+    the ThreadPoolExecutor overhead is negligible for cache hits.
+    """
+    results: dict  = {}
+    errors:  list  = []
+
+    def _one(gen_type: str) -> tuple[str, str]:
+        return gen_type, _generate_fn(
+            resume=resume, jd=jd, type=gen_type,
+            custom_instruction=custom_instruction,
+            no_jd=no_jd,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(gen_types) or 1) as pool:
+        futures = {pool.submit(_one, t): t for t in gen_types}
+        for future in concurrent.futures.as_completed(futures):
+            gen_type = futures[future]
+            try:
+                _, result = future.result()
+                results[gen_type] = result
+            except Exception as exc:
+                log.error("[generate] %s failed: %s", gen_type, exc)
+                errors.append(f"{gen_type}: {exc}")
+
+    return results, errors
 
 
 # ======================================================================
@@ -157,6 +201,7 @@ def start_session(req: StartSessionRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+    register_thread(thread_id)
     interrupt_payload = _get_interrupt(thread_id)
     return StartSessionResponse(thread_id=thread_id, interrupt=interrupt_payload)
 
@@ -315,20 +360,13 @@ def generate_from_session(thread_id: str, req: SessionGenerateRequest):
             agent, original_resume.personal_info
         )
 
-        from app.agents.generator_agent import generate as generate_fn
-
-        results: dict = {}
-        errors:  list = []
-        for gen_type in req.generation_types:
-            try:
-                results[gen_type] = generate_fn(
-                    resume=tailored_resume, jd=parsed_jd, type=gen_type,
-                    custom_instruction=req.custom_instruction,
-                    no_jd=req.no_jd,
-                )
-            except Exception as exc:
-                errors.append(f"{gen_type}: {exc}")
-
+        results, errors = _run_generation_parallel(
+            gen_types=req.generation_types,
+            resume=tailored_resume,
+            jd=parsed_jd,
+            custom_instruction=req.custom_instruction,
+            no_jd=req.no_jd,
+        )
         return SessionGenerateResponse(
             results=results,
             errors="; ".join(errors) if errors else None,
@@ -377,18 +415,13 @@ def generate_from_items(thread_id: str, req: GenerateFromItemsRequest):
         agent      = pl.build_edit_agent(edit_state, parsed_jd, cycle_id=0)
         tailored   = pl.collapse_edit_state_to_resume(agent, parsed_resume.personal_info)
 
-        results: dict = {}
-        errors:  list = []
-        for gen_type in req.generation_types:
-            try:
-                results[gen_type] = _generate_fn(
-                    resume=tailored, jd=parsed_jd, type=gen_type,
-                    custom_instruction=req.custom_instruction,
-                    no_jd=req.no_jd,
-                )
-            except Exception as exc:
-                errors.append(f"{gen_type}: {exc}")
-
+        results, errors = _run_generation_parallel(
+            gen_types=req.generation_types,
+            resume=tailored,
+            jd=parsed_jd,
+            custom_instruction=req.custom_instruction,
+            no_jd=req.no_jd,
+        )
         return SessionGenerateResponse(
             results=results,
             errors="; ".join(errors) if errors else None,
@@ -415,9 +448,6 @@ def quick_generate(req: QuickGenerateRequest):
     Useful at the start of a workflow when the user wants cover letter / email
     / outreach message without going through the full editing flow.
     """
-    import concurrent.futures
-    from app.agents.generator_agent import generate as generate_fn
-
     try:
         # ── Cold-outreach mode: no JD required ─────────────────────────
         if req.no_jd:
@@ -426,18 +456,13 @@ def quick_generate(req: QuickGenerateRequest):
             else:
                 _, parsed_resume = pl.load_latest_resume_for_user(req.user_id)
 
-            results: dict = {}
-            errors:  list = []
-            for gen_type in req.generation_types:
-                try:
-                    results[gen_type] = generate_fn(
-                        resume=parsed_resume, jd=None, type=gen_type,
-                        custom_instruction=req.custom_instruction,
-                        no_jd=True,
-                    )
-                except Exception as exc:
-                    errors.append(f"{gen_type}: {exc}")
-
+            results, errors = _run_generation_parallel(
+                gen_types=req.generation_types,
+                resume=parsed_resume,
+                jd=None,
+                custom_instruction=req.custom_instruction,
+                no_jd=True,
+            )
             return QuickGenerateResponse(
                 results=results,
                 parsed_jd=None,
@@ -476,19 +501,14 @@ def quick_generate(req: QuickGenerateRequest):
         agent      = pl.build_edit_agent(edit_state, parsed_jd, cycle_id=0)
         tailored   = pl.collapse_edit_state_to_resume(agent, parsed_resume.personal_info)
 
-        # ── Generate documents ──────────────────────────────────────────
-        results: dict = {}
-        errors:  list = []
-        for gen_type in req.generation_types:
-            try:
-                results[gen_type] = generate_fn(
-                    resume=tailored, jd=parsed_jd, type=gen_type,
-                    custom_instruction=req.custom_instruction,
-                    no_jd=False,
-                )
-            except Exception as exc:
-                errors.append(f"{gen_type}: {exc}")
-
+        # ── Generate all docs in parallel (cache hits return instantly) ─
+        results, errors = _run_generation_parallel(
+            gen_types=req.generation_types,
+            resume=tailored,
+            jd=parsed_jd,
+            custom_instruction=req.custom_instruction,
+            no_jd=False,
+        )
         return QuickGenerateResponse(
             results=results,
             parsed_jd=parsed_jd.model_dump(),

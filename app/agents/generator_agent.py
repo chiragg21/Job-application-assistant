@@ -109,10 +109,13 @@ Your task is to generate a tailored, compelling cover letter using the provided
 {_TRUTHFULNESS_GUARDRAIL}
 
 {_custom_instruction_block(custom_instruction)}
+
+### OUTPUT SCHEMA (return JSON matching this exactly):
+{CoverLetter.model_json_schema()}
 """
 
     prompt = f"""
-Generate a Cover Letter for the candidate below and strictly follow the output schema.
+Generate a Cover Letter for the candidate below.
 
 {"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
 {"{}" if no_jd else str(job_description)}
@@ -121,14 +124,6 @@ Generate a Cover Letter for the candidate below and strictly follow the output s
 
 ### Candidate Resume:
 {resume_content}
-
----
-
-### OUTPUT FORMAT (STRICT JSON)
-
-Return JSON matching this schema:
-
-{CoverLetter.model_json_schema()}
 """
     return system_prompt, prompt
 
@@ -165,10 +160,13 @@ Your task is to generate a concise, personalized outreach message to a recruiter
 {_TRUTHFULNESS_GUARDRAIL}
 
 {_custom_instruction_block(custom_instruction)}
+
+### OUTPUT SCHEMA (return JSON matching this exactly):
+{OutreachMessage.model_json_schema()}
 """
 
     prompt = f"""
-Generate an Outreach Message for the candidate below and strictly follow the output schema.
+Generate an Outreach Message for the candidate below.
 
 {"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
 {"{}" if no_jd else str(job_description)}
@@ -177,14 +175,6 @@ Generate an Outreach Message for the candidate below and strictly follow the out
 
 ### Candidate Resume:
 {resume_content}
-
----
-
-### OUTPUT FORMAT (STRICT JSON)
-
-Return JSON matching this schema:
-
-{OutreachMessage.model_json_schema()}
 """
     return system_prompt, prompt
 
@@ -221,10 +211,13 @@ Rules:
 {_TRUTHFULNESS_GUARDRAIL}
 
 {_custom_instruction_block(custom_instruction)}
+
+### OUTPUT SCHEMA (return JSON matching this exactly):
+{Email.model_json_schema()}
 """
 
     prompt = f"""
-Generate an Email for the candidate below and strictly follow the output schema.
+Generate an Email for the candidate below.
 
 {"### Context: " + _NO_JD_NOTE if no_jd else "### Job Description:"}
 {"{}" if no_jd else str(job_description)}
@@ -233,14 +226,6 @@ Generate an Email for the candidate below and strictly follow the output schema.
 
 ### Candidate Resume:
 {resume_content}
-
----
-
-### OUTPUT FORMAT (STRICT JSON)
-
-Return JSON matching this schema exactly:
-
-{Email.model_json_schema()}
 """
     return system_prompt, prompt
 
@@ -256,20 +241,31 @@ def generate(
     custom_instruction: str | None = None,
     no_jd: bool = False,
 ):
+    from app.core.gen_cache import generation_cache
+
     resume_dict = {key: resume.model_dump()[key] for key in ["personal_info", "resume_sections"]}
-    jd_dict     = jd.model_dump() if jd and not no_jd else {}
+    # Use None (not {}) when JD is absent or intentionally ignored so that
+    # the cache key is unambiguous — {} would conflate "no JD" with "empty JD".
+    jd_dict     = jd.model_dump() if (jd is not None and not no_jd) else None
 
     action_map = {
-        "coverletter":     (generate_cover_letter_prompt,    CoverLetter,      render_cover_letter),
-        "outreachmessage": (generate_outreach_message_prompt, OutreachMessage,  render_outreach_message),
-        "email":           (generate_email_prompt,            Email,            render_email),
+        "coverletter":     (generate_cover_letter_prompt,     CoverLetter,     render_cover_letter),
+        "outreachmessage": (generate_outreach_message_prompt, OutreachMessage, render_outreach_message),
+        "email":           (generate_email_prompt,            Email,           render_email),
     }
 
     type = type.lower().replace("_", "")
     if type not in action_map:
         raise ValueError(f"Unknown generation type: '{type}'")
 
-    action, model, render = action_map[type]
+    # ── Cache check — skip LLM entirely on identical inputs ───────────────
+    cache_key = generation_cache.make_key(jd_dict, resume_dict, type, custom_instruction, no_jd)
+    cached    = generation_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # ── LLM call ──────────────────────────────────────────────────────────
+    action, model, render_fn = action_map[type]
     system_prompt, prompt = action(
         jd_dict, resume_dict,
         custom_instruction=custom_instruction,
@@ -284,4 +280,6 @@ def generate(
     if not response.schema_matched or response.parsed is None:
         raise ValueError(f"LLM response did not match {model.__name__} schema")
 
-    return render(response.parsed)
+    result = render_fn(response.parsed)
+    generation_cache.set(cache_key, type, result)
+    return result
