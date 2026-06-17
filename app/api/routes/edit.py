@@ -22,8 +22,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import json
+import queue as _queue_module
+
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, model_validator
 
 from langgraph.types import Command
@@ -197,9 +200,10 @@ def start_session(req: StartSessionRequest):
     config    = _config(thread_id)
 
     initial_state: dict = {
-        "user_id":  req.user_id,
-        "jd_text":  req.jd_text,
-        "cycle_id": 1,
+        "user_id":   req.user_id,
+        "jd_text":   req.jd_text,
+        "cycle_id":  1,
+        "thread_id": thread_id,
     }
     if req.custom_instruction and req.custom_instruction.strip():
         initial_state["custom_instruction"] = req.custom_instruction.strip()
@@ -263,6 +267,75 @@ def resume_session(thread_id: str, req: ResumeRequest):
     return ResumeResponse(
         interrupt=interrupt_payload,
         stage=current_state.get("stage"),
+    )
+
+
+# ======================================================================
+# GET /edit/{thread_id}/stream  — SSE: section suggestions arrive in real
+# time as each parallel LLM call completes during generate_suggestions.
+#
+# Connect BEFORE calling POST /resume (item_selection response) so the
+# queue is ready when the graph node starts pushing events.
+#
+# Event shapes
+# ------------
+#   data: {"type": "section_done", "section": str, "item": str|null,
+#          "lines_to_change": [...], "suggested_changes": [...],
+#          "bullets_to_drop": [...]}
+#   data: {"type": "done"}          — all sections have been processed
+#   event: keepalive / data: {}     — sent every 15 s to keep the connection
+#                                     alive through proxies and load balancers
+# ======================================================================
+
+@router.get("/{thread_id}/stream")
+def stream_suggestions(thread_id: str):
+    """
+    Server-Sent Events endpoint that streams per-section suggestion results
+    as they arrive from the parallel LLM calls in generate_suggestions.
+    """
+    from app.core import stream as stream_module
+
+    q = stream_module.get_or_create(thread_id)
+
+    # Hard cap so a producer that dies before publishing a terminal event
+    # can never leave this connection open forever (which would consume a
+    # browser connection slot and eventually hang every other request).
+    _KEEPALIVE_TIMEOUT = 15          # seconds per q.get()
+    _MAX_LIFETIME      = 10 * 60     # 10 minutes of total streaming
+    _MAX_KEEPALIVES    = _MAX_LIFETIME // _KEEPALIVE_TIMEOUT
+
+    def generate():
+        idle_ticks = 0
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=_KEEPALIVE_TIMEOUT)
+                except _queue_module.Empty:
+                    idle_ticks += 1
+                    if idle_ticks >= _MAX_KEEPALIVES:
+                        # Producer never finished — terminate so the client
+                        # closes the connection instead of holding it open.
+                        yield f'data: {json.dumps({"type": "error", "reason": "stream timed out"})}\n\n'
+                        break
+                    # keepalive to prevent proxy/LB timeout
+                    yield "event: keepalive\ndata: {}\n\n"
+                    continue
+
+                idle_ticks = 0
+                yield f"data: {json.dumps(event)}\n\n"
+
+                if event.get("type") in ("done", "error"):
+                    break
+        finally:
+            stream_module.discard(thread_id)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
     )
 
 
@@ -833,6 +906,68 @@ def get_resume_diff(thread_id: str):
             atomic_sections=atomic,
             has_changes=has_changes,
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ======================================================================
+# Optimizer endpoint
+# POST /edit/{thread_id}/optimize
+# ======================================================================
+
+class OptimizeRequest(BaseModel):
+    target_pages: int = 1
+
+
+@router.post("/{thread_id}/optimize")
+def optimize_resume(thread_id: str, req: OptimizeRequest):
+    """
+    Launch the one-page optimizer for the current edit session.
+    Builds the current LaTeX from state, runs the drop loop + condensation,
+    and returns {page_count, dropped_items, final_latex}.
+    For long compilations this is synchronous; the client shows a loading state.
+    """
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = edit_graph.get_state(config)
+        if not snapshot or not snapshot.values:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        state_vals = snapshot.values
+        agent   = _rebuild_agent(state_vals)
+        user_id = state_vals.get("user_id", 1)
+        job_id  = state_vals.get("job_id")
+
+        latex        = pl.build_preview(edit_agent=agent, user_id=user_id)
+        ranked_items = state_vals.get("ranked_items", [])
+
+        from app.graph.optimizer_graph import OptimizerState
+        from app.graph.optimizer_graph import node_init, node_drop_loop, _compile_and_count
+
+        # Run the drop-loop inline (no checkpointing needed — this is a one-shot op)
+        opt_state: OptimizerState = node_init({
+            "latex":        latex,
+            "ranked_items": ranked_items,
+            "user_id":      user_id,
+            "job_id":       job_id,
+        })
+
+        max_drops = len(ranked_items)
+        for _ in range(max_drops):
+            if opt_state.get("page_count", 1) <= 1:
+                break
+            if not opt_state.get("drop_candidates"):
+                break
+            opt_state = {**opt_state, **node_drop_loop(opt_state)}
+
+        return {
+            "page_count":    opt_state.get("page_count", 1),
+            "dropped_items": opt_state.get("dropped_items", []),
+            "final_latex":   opt_state.get("current_latex", latex),
+            "stage":         "optimizer_done" if opt_state.get("page_count", 1) <= 1 else "optimizer_partial",
+        }
     except HTTPException:
         raise
     except Exception as exc:

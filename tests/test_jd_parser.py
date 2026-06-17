@@ -37,16 +37,16 @@ def parser(mock_sql):
     """JDParser with all external I/O mocked."""
     mock_chunks_col = MagicMock()
     mock_cached_col = MagicMock()
+    mock_chroma     = MagicMock()
+    mock_ef         = MagicMock()
 
-    def _get_col(name):
-        return mock_chunks_col if "chunks" in name else mock_cached_col
+    mock_chroma.get_or_create_collection.side_effect = (
+        lambda name, **kw: mock_chunks_col if "chunks" in name else mock_cached_col
+    )
 
-    mock_chroma = MagicMock()
-    mock_chroma.get_collection.side_effect = _get_col
-
-    with patch("app.core.jd_parser.SQLHandler", return_value=mock_sql), \
-         patch("app.core.jd_parser.chromadb.PersistentClient", return_value=mock_chroma), \
-         patch("app.core.jd_parser._llm"):
+    with patch("app.core.jd_parser.SQLHandler",        return_value=mock_sql), \
+         patch("app.core.jd_parser.get_chroma_client", return_value=mock_chroma), \
+         patch("app.core.jd_parser.get_ef",            return_value=mock_ef):
         p = JDParser()
     p.db             = mock_sql
     p._col_jd_chunks = mock_chunks_col
@@ -87,33 +87,31 @@ class TestCheckDuplicate:
 
 class TestParseWithLLM:
     def test_returns_parsed_jd(self, parser, sample_jd):
-        parser.llm_helper.generate.return_value = MagicMock(
-            schema_matched=True,
-            parsed=sample_jd,
-        )
-        result = parser.parse_with_llm("JD text about ML Engineer role")
+        with patch("app.core.jd_parser.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_jd, error=None)
+            result = parser.parse_with_llm("JD text about ML Engineer role")
         assert isinstance(result, ParsedJD)
         assert result.raw_text == "JD text about ML Engineer role"
 
     def test_sets_raw_text_on_parsed(self, parser, sample_jd):
-        parser.llm_helper.generate.return_value = MagicMock(
-            schema_matched=True,
-            parsed=sample_jd,
-        )
-        result = parser.parse_with_llm("my raw jd text")
+        with patch("app.core.jd_parser.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_jd, error=None)
+            result = parser.parse_with_llm("my raw jd text")
         assert result.raw_text == "my raw jd text"
 
     def test_schema_mismatch_raises(self, parser):
-        parser.llm_helper.generate.return_value = MagicMock(
-            schema_matched=False, parsed=None
-        )
-        with pytest.raises(ValueError, match="schema"):
-            parser.parse_with_llm("JD text")
+        with patch("app.core.jd_parser.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(
+                schema_matched=False, parsed=None, error=None, content=""
+            )
+            with pytest.raises(ValueError):
+                parser.parse_with_llm("JD text")
 
     def test_llm_exception_propagates(self, parser):
-        parser.llm_helper.generate.side_effect = RuntimeError("API error")
-        with pytest.raises(RuntimeError, match="API error"):
-            parser.parse_with_llm("JD text")
+        with patch("app.core.jd_parser.generate_for_task") as mock_gtf:
+            mock_gtf.side_effect = RuntimeError("API error")
+            with pytest.raises(RuntimeError, match="API error"):
+                parser.parse_with_llm("JD text")
 
 
 # ── save_to_sqlite ────────────────────────────────────────────────────────────
@@ -192,28 +190,25 @@ class TestRun:
         parser.db.fetch_by_hash.return_value = {"id": 99}
         parser.db.fetch_one.return_value = {"jd_parsed": json.dumps(sample_jd.to_dict())}
 
-        result = parser.run("some jd text", user_id=1)
+        with patch.object(parser, "parse_with_llm") as mock_parse:
+            result = parser.run("some jd text", user_id=1)
 
         assert result["duplicate"] is True
         assert result["duplicate_type"] == "raw_hash"
         assert result["job_id"] == 99
-        parser.llm_helper.generate.assert_not_called()
+        mock_parse.assert_not_called()
 
     def test_new_jd_runs_full_pipeline(self, parser, sample_jd):
-        # No duplicate found at either stage
         parser.db.fetch_by_hash.return_value = None
         parser.db.fetch_one.return_value = {"id": 1}
         parser.db.add_one.return_value = 1
-        parser.llm_helper.generate.return_value = MagicMock(
-            schema_matched=True,
-            parsed=sample_jd,
-        )
 
-        result = parser.run("About DeepMind...", user_id=1)
+        with patch.object(parser, "parse_with_llm", return_value=sample_jd) as mock_parse:
+            result = parser.run("About DeepMind...", user_id=1)
 
         assert result["duplicate"] is False
         assert result["job_id"] == 1
-        parser.llm_helper.generate.assert_called_once()
+        mock_parse.assert_called_once()
         parser._col_jd_chunks.upsert.assert_called_once()
         parser._col_cached.upsert.assert_called_once()
 
@@ -225,16 +220,13 @@ class TestRun:
         """Step 1 raw hash misses, Step 3 parsed hash hits — no SQL insert."""
         def _fetch_by_hash(table, col, hash_val):
             if col == "raw_hash":
-                return None          # no raw duplicate
-            return {"id": 55}        # parsed hash duplicate found
+                return None
+            return {"id": 55}
 
         parser.db.fetch_by_hash.side_effect = _fetch_by_hash
-        parser.llm_helper.generate.return_value = MagicMock(
-            schema_matched=True,
-            parsed=sample_jd,
-        )
 
-        result = parser.run("unique jd text not seen before", user_id=1)
+        with patch.object(parser, "parse_with_llm", return_value=sample_jd):
+            result = parser.run("unique jd text not seen before", user_id=1)
 
         assert result["duplicate"] is True
         assert result["duplicate_type"] == "parsed_hash"

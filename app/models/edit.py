@@ -9,6 +9,7 @@ class OneLlmOutput(BaseModel):
     name: Optional[str] = Field(None, description="item_name of the company or project this output applies to; null for flat sections")
     lines_to_change: List[str] = Field(..., description="list of specific lines to be changed from latex content")
     suggested_changes: List[str] = Field(..., description="list of suggestions to replace original lines, also in latex")
+    bullets_to_drop: List[str] = Field(default_factory=list, description="exact \\item lines that are irrelevant to the JD and should be removed")
 
 class WholeLlmOutput(BaseModel):
     education: OneLlmOutput
@@ -24,6 +25,7 @@ class SectionEditState(BaseModel):
     lines_to_change: List[str] = Field(default_factory=list)
     suggested_changes: List[str] = Field(default_factory=list)
     updated_section: str
+    bullets_dropped: List[str] = Field(default_factory=list)
 
 class ItemEditState(SectionEditState):
     item_name: str

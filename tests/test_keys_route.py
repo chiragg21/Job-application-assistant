@@ -10,9 +10,17 @@ from fastapi.testclient import TestClient
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def mock_llm():
+def mock_client():
+    """A single mock LLM client that sits in ALL_CLIENTS."""
     m = MagicMock()
-    m.status.return_value = [
+    return m
+
+
+@pytest.fixture
+def mock_merged_status():
+    """Mock for the merged_status() function exported by app.utils.llm."""
+    fn = MagicMock()
+    fn.return_value = [
         {
             "provider":    "gemini",
             "key_id":      "AIza1234",
@@ -23,19 +31,22 @@ def mock_llm():
             "recent_meta": [],
         }
     ]
-    return m
+    return fn
 
 
 @pytest.fixture
-def keys_client(mock_llm, tmp_path):
+def keys_client(mock_client, mock_merged_status, tmp_path):
     """Minimal FastAPI app with only the keys router + all heavy deps mocked."""
     from app.api.routes.keys import router
     app = FastAPI()
     app.include_router(router)
     user_keys_path = tmp_path / "user_keys.json"
-    with patch("app.api.routes.keys.llm", mock_llm), \
+    # Store mock_merged_status on mock_client for easy retrieval in tests
+    mock_client._mock_merged_status = mock_merged_status
+    with patch("app.api.routes.keys.ALL_CLIENTS", [mock_client]), \
+         patch("app.api.routes.keys.merged_status", mock_merged_status), \
          patch("app.api.routes.keys._USER_KEYS_PATH", user_keys_path):
-        yield TestClient(app), mock_llm, user_keys_path
+        yield TestClient(app), mock_client, user_keys_path
 
 
 # ── GET /keys/status ──────────────────────────────────────────────────────────
@@ -55,17 +66,17 @@ class TestGetKeyStatus:
     def test_calls_llm_status_no_filter(self, keys_client):
         client, mock_llm, _ = keys_client
         client.get("/keys/status")
-        mock_llm.status.assert_called_once_with(provider=None)
+        mock_llm._mock_merged_status.assert_called_once_with(provider=None)
 
     def test_provider_filter_forwarded_to_status(self, keys_client):
         client, mock_llm, _ = keys_client
-        mock_llm.status.return_value = []
+        mock_llm._mock_merged_status.return_value = []
         client.get("/keys/status?provider=gemini")
-        mock_llm.status.assert_called_once_with(provider="gemini")
+        mock_llm._mock_merged_status.assert_called_once_with(provider="gemini")
 
     def test_status_error_returns_500(self, keys_client):
         client, mock_llm, _ = keys_client
-        mock_llm.status.side_effect = RuntimeError("internal error")
+        mock_llm._mock_merged_status.side_effect = RuntimeError("internal error")
         resp = client.get("/keys/status")
         assert resp.status_code == 500
 
@@ -211,7 +222,7 @@ class TestLoadUserKeys:
             {"provider": "gemini", "key": "AIzaPersistedKey1"},
             {"provider": "groq",   "key": "gsk_PersistedKey2"},
         ]))
-        with patch("app.api.routes.keys.llm", mock_llm), \
+        with patch("app.api.routes.keys.ALL_CLIENTS", [mock_llm]), \
              patch("app.api.routes.keys._USER_KEYS_PATH", user_keys_path):
             from app.api.routes.keys import load_user_keys
             load_user_keys()
@@ -222,7 +233,7 @@ class TestLoadUserKeys:
     def test_missing_file_does_not_raise(self, tmp_path):
         mock_llm = MagicMock()
         user_keys_path = tmp_path / "nonexistent.json"
-        with patch("app.api.routes.keys.llm", mock_llm), \
+        with patch("app.api.routes.keys.ALL_CLIENTS", [mock_llm]), \
              patch("app.api.routes.keys._USER_KEYS_PATH", user_keys_path):
             from app.api.routes.keys import load_user_keys
             load_user_keys()   # must not raise
@@ -235,7 +246,7 @@ class TestLoadUserKeys:
         user_keys_path.write_text(json.dumps([
             {"provider": "gemini", "key": "AIzaBadKey"},
         ]))
-        with patch("app.api.routes.keys.llm", mock_llm), \
+        with patch("app.api.routes.keys.ALL_CLIENTS", [mock_llm]), \
              patch("app.api.routes.keys._USER_KEYS_PATH", user_keys_path):
             from app.api.routes.keys import load_user_keys
             load_user_keys()   # must not raise even if add_key fails

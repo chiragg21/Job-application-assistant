@@ -441,6 +441,20 @@ class ResumeParser:
             "section_type":  section_type,
         })
 
+    def _parse_bullet_lines(self, content_latex: str) -> list[str]:
+        """
+        Extract \\item lines from LaTeX content, each as a standalone string.
+
+        Returns an empty list when the content has no bullet points, so the
+        caller knows to store it as a plain flat section instead.
+        """
+        bullets: list[str] = []
+        for m in re.finditer(r'(\\item\b.*?)(?=\\item\b|\Z)', content_latex, re.DOTALL):
+            bullet = m.group(0).strip()
+            if bullet:
+                bullets.append(bullet)
+        return bullets
+
     def _persist_section_items(
         self,
         resume_id: int,
@@ -480,20 +494,23 @@ class ResumeParser:
         resume_id: int,
         personal: PersonalInfo,
         sections: ResumeSection,
-        atomic_rows: dict,  # {section_name: List[Tuple[AtomicItem, int]]}
+        atomic_rows: dict,      # {section_name: List[Tuple[AtomicItem, int]]}
+        flat_item_rows: dict | None = None,  # {section_name: List[Tuple[AtomicItem, int]]}
     ):
         """
         Upserts all section content into ChromaDB.
 
-        Flat sections   -> one document per section  (id: res{resume_id}_{section_name})
-        Atomic sections -> one document per item      (id: sec_item_{sql_row_id})
+        Plain flat sections  -> one document per section  (id: res{resume_id}_{section_name})
+        Flat-items sections  -> one document per bullet   (id: sec_item_{sql_row_id})
+        Atomic sections      -> one document per item     (id: sec_item_{sql_row_id})
 
-        Atomic item metadata carries sql_id so a vector result can be traced:
+        Item/bullet metadata carries sql_id so a vector result can be traced:
             ChromaDB -> resume_section_items.id -> resume_sections.id -> resumes.id
         """
         log.info(f"Embedding resume sections for resume_id={resume_id}")
 
         documents, metadatas, ids = [], [], []
+        flat_items = flat_item_rows or {}
 
         base_meta = {
             "resume_id": resume_id,
@@ -501,13 +518,31 @@ class ResumeParser:
             "email": personal.email,
         }
 
-        # 1. Flat sections — one chunk each
+        # 1. Flat sections — one chunk each (only for plain blobs, not flat_items)
         for sec_name in FLAT_SECTIONS:
+            if sec_name in flat_items:
+                continue  # handled below as per-bullet chunks
             value: SectionContent = getattr(sections, sec_name, None)
             if value and value.content_text and value.content_text.strip():
                 documents.append(value.content_text)
                 metadatas.append({**base_meta, "section_type": sec_name})
                 ids.append(f"res{resume_id}_{sec_name}")
+
+        # 1b. Flat-items sections — one chunk per bullet, keyed by SQL row id
+        for sec_name, rows in flat_items.items():
+            for item, sql_id in rows:
+                if not (item.content_text and item.content_text.strip()):
+                    continue
+                documents.append(item.content_text)
+                metadatas.append({
+                    **base_meta,
+                    "section_type": sec_name,
+                    "sql_table": "resume_section_items",
+                    "sql_id": sql_id,
+                    "item_name": "",
+                    "role_title": "",
+                })
+                ids.append(f"sec_item_{sql_id}")
 
         # 2. Atomic sections — one chunk per item, keyed by SQL row id
         for sec_name, rows in atomic_rows.items():
@@ -542,17 +577,46 @@ class ResumeParser:
         })
 
         # 2. Persist all sections into resume_sections (one row each).
-        #    Atomic sections additionally fan out into resume_section_items.
-        atomic_rows = {}
+        #    Atomic sections fan out into resume_section_items.
+        #    Flat sections with \\item bullets also fan out so individual bullets
+        #    can be retrieved, selected, and versioned independently.
+        atomic_rows: dict[str, list] = {}
+        flat_item_rows: dict[str, list] = {}
 
-        # Flat sections — just the parent row, no child items
         for sec_name in FLAT_SECTIONS:
             sc: Optional[SectionContent] = getattr(resume_sections, sec_name, None)
-            self._persist_section(
-                resume_id, sec_name,
-                content_latex=sc.content_latex if sc else None,
-                content_text=sc.content_text if sc else None,
-            )
+            latex   = sc.content_latex if sc else None
+            text    = sc.content_text  if sc else None
+            bullets = self._parse_bullet_lines(latex or "")
+
+            if bullets:
+                # Store as flat_items: one row per bullet in resume_section_items
+                section_id = self._persist_section(
+                    resume_id, sec_name,
+                    content_latex=latex,
+                    content_text=text,
+                    section_type="flat_items",
+                )
+                bullet_items = [
+                    AtomicItem(
+                        name=None,
+                        role=None,
+                        content_latex=b,
+                        content_text=re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1',
+                                            re.sub(r'[\\{}]', '', b)).strip(),
+                    )
+                    for b in bullets
+                ]
+                flat_item_rows[sec_name] = self._persist_section_items(
+                    resume_id, section_id, sec_name, bullet_items
+                )
+            else:
+                # No bullets — store as plain flat blob
+                self._persist_section(
+                    resume_id, sec_name,
+                    content_latex=latex,
+                    content_text=text,
+                )
 
         # Atomic sections — parent row (full blob) + child item rows
         for sec_name in ATOMIC_SECTIONS:
@@ -574,7 +638,7 @@ class ResumeParser:
             )
 
         # 3. Embed everything into ChromaDB
-        self.chunk_and_embed(resume_id, personal, resume_sections, atomic_rows)
+        self.chunk_and_embed(resume_id, personal, resume_sections, atomic_rows, flat_item_rows)
 
         # 4. Create a default layout row for this resume
         try:

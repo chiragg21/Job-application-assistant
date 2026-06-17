@@ -6,12 +6,13 @@
 #   uv run uvicorn app.api.main:app --reload
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import jd, resume, edit, generate, score, keys
+from app.api.routes import jd, resume, edit, generate, score, keys, library, auth, applications, skills
 from app.utils import get_logger
 
 log = get_logger(__name__)
@@ -56,6 +57,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ----------------------------------------------------------------------
+# Request tracing — logs every request's arrival and completion so we can
+# see in the console which calls reach the server and whether they finish
+# (a request that logs "→ START" but never "← DONE" is hanging server-side;
+#  a page that hangs with NO "→ START" line means the request never left the
+#  browser, e.g. connection-pool exhaustion).
+# ----------------------------------------------------------------------
+@app.middleware("http")
+async def trace_requests(request: Request, call_next):
+    # Use print(flush=True) rather than the logger: uvicorn reconfigures
+    # Python logging on startup and can swallow handler output, whereas a
+    # flushed print is guaranteed to land in the uvicorn console live.
+    t0 = time.perf_counter()
+    print(f"[trace] >> START {request.method} {request.url.path}", flush=True)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        dt = (time.perf_counter() - t0) * 1000
+        print(f"[trace] !! ERROR {request.method} {request.url.path}  "
+              f"({dt:.0f} ms): {exc!r}", flush=True)
+        raise
+    dt = (time.perf_counter() - t0) * 1000
+    print(f"[trace] << DONE  {request.method} {request.url.path}  "
+          f"{response.status_code}  ({dt:.0f} ms)", flush=True)
+    return response
+
+
 # Allow all origins for local dev; tighten for production
 app.add_middleware(
     CORSMiddleware,
@@ -74,6 +102,10 @@ app.include_router(edit.router)
 app.include_router(generate.router)
 app.include_router(score.router)
 app.include_router(keys.router)
+app.include_router(library.router)
+app.include_router(auth.router)
+app.include_router(applications.router)
+app.include_router(skills.router)
 
 
 # -----------------------------------------------------------------------

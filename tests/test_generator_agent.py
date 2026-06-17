@@ -162,41 +162,33 @@ class TestPromptBuilders:
 
 class TestGenerate:
     def test_generate_cover_letter(self, sample_parsed_resume, sample_jd, sample_cover_letter):
-        with patch("app.agents.generator_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(
-                schema_matched=True,
-                parsed=sample_cover_letter,
-            )
+        with patch("app.agents.generator_agent.generate_for_task") as mock_gtf, \
+             patch("app.core.gen_cache.generation_cache.get", return_value=None):
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_cover_letter)
             result = generate(sample_parsed_resume, sample_jd, "coverletter")
 
         assert "Chirag Garg" in result or "excited" in result
 
     def test_generate_email(self, sample_parsed_resume, sample_jd, sample_email):
-        with patch("app.agents.generator_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(
-                schema_matched=True,
-                parsed=sample_email,
-            )
+        with patch("app.agents.generator_agent.generate_for_task") as mock_gtf, \
+             patch("app.core.gen_cache.generation_cache.get", return_value=None):
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_email)
             result = generate(sample_parsed_resume, sample_jd, "email")
 
         assert "Subject:" in result
 
     def test_generate_outreach_message(self, sample_parsed_resume, sample_jd, sample_outreach):
-        with patch("app.agents.generator_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(
-                schema_matched=True,
-                parsed=sample_outreach,
-            )
+        with patch("app.agents.generator_agent.generate_for_task") as mock_gtf, \
+             patch("app.core.gen_cache.generation_cache.get", return_value=None):
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_outreach)
             result = generate(sample_parsed_resume, sample_jd, "outreachmessage")
 
         assert sample_outreach.full_message in result
 
     def test_type_normalised_with_underscore(self, sample_parsed_resume, sample_jd, sample_cover_letter):
-        with patch("app.agents.generator_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(
-                schema_matched=True,
-                parsed=sample_cover_letter,
-            )
+        with patch("app.agents.generator_agent.generate_for_task") as mock_gtf, \
+             patch("app.core.gen_cache.generation_cache.get", return_value=None):
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=sample_cover_letter)
             result = generate(sample_parsed_resume, sample_jd, "cover_letter")
         assert isinstance(result, str)
 
@@ -205,7 +197,8 @@ class TestGenerate:
             generate(sample_parsed_resume, sample_jd, "unknown_type")
 
     def test_schema_mismatch_raises(self, sample_parsed_resume, sample_jd):
-        with patch("app.agents.generator_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(schema_matched=False, parsed=None)
+        with patch("app.agents.generator_agent.generate_for_task") as mock_gtf, \
+             patch("app.core.gen_cache.generation_cache.get", return_value=None):
+            mock_gtf.return_value = MagicMock(schema_matched=False, parsed=None)
             with pytest.raises(ValueError, match="schema"):
                 generate(sample_parsed_resume, sample_jd, "email")

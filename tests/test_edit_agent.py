@@ -142,15 +142,17 @@ class TestParaphrase:
         assert agent.editing_cycle.current_node_id == 1
 
     def test_paraphrase_calls_generate(self, agent):
-        mock = self._mock_llm(agent, self._make_one_llm_output())
-        agent.edit_section("skills", "paraphrase")
-        mock.generate.assert_called_once()
+        output = self._make_one_llm_output()
+        with patch("app.agents.edit_agent.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=output)
+            agent.edit_section("skills", "paraphrase")
+        mock_gtf.assert_called_once()
 
     def test_paraphrase_schema_mismatch_raises(self, agent):
-        agent.llmhandler = MagicMock()
-        agent.llmhandler.generate.return_value = MagicMock(schema_matched=False, parsed=None)
-        with pytest.raises(ValueError, match="schema"):
-            agent.edit_section("skills", "paraphrase")
+        with patch("app.agents.edit_agent.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=False, parsed=None)
+            with pytest.raises(ValueError, match="schema"):
+                agent.edit_section("skills", "paraphrase")
 
 
 # ── Another suggestion ────────────────────────────────────────────────────────
@@ -280,14 +282,17 @@ class TestResumeSuggestions:
         assert agent.editing_cycle.current_node_id == 1
 
     def test_resume_suggestions_schema_mismatch_raises(self, agent):
-        agent.llmhandler = MagicMock()
-        agent.llmhandler.generate.return_value = MagicMock(
-            schema_matched=False, parsed=None
-        )
-        with patch("app.agents.edit_agent.FLAT_SECTIONS", ["skills"]), \
+        # Schema mismatches are caught per-section and fall back to empty output;
+        # _resume_suggestions still completes without raising.
+        with patch("app.agents.edit_agent.generate_for_task") as mock_gtf, \
+             patch("app.agents.edit_agent.suggestions_cache") as mock_cache, \
+             patch("app.agents.edit_agent.FLAT_SECTIONS", ["skills"]), \
              patch("app.agents.edit_agent.ATOMIC_SECTIONS", []):
-            with pytest.raises(ValueError, match="schema"):
-                agent._resume_suggestions()
+            mock_cache.get.return_value = None
+            mock_cache.make_key.return_value = "test-key"
+            mock_gtf.return_value = MagicMock(schema_matched=False, parsed=None)
+            agent._resume_suggestions()  # must not raise
+        assert agent.editing_cycle.current_node_id >= 1
 
 
 # ── Paraphrase on atomic (item-level) section ────────────────────────────────

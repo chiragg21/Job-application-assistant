@@ -99,15 +99,20 @@ class TestBuildLLMScorePrompt:
 class TestGetEmbedding:
     def test_returns_ndarray(self):
         fake_vector = [0.1, 0.2, 0.3]
-        with patch("app.agents.score_agent._ef") as mock_ef:
-            mock_ef.return_value = [fake_vector]
+        _get_embedding.cache_clear()
+        with patch("app.agents.score_agent.get_ef") as mock_get_ef:
+            mock_ef = MagicMock(return_value=[fake_vector])
+            mock_get_ef.return_value = mock_ef
             result = _get_embedding("some text")
-        assert isinstance(result, np.ndarray)
-        np.testing.assert_array_almost_equal(result, np.array(fake_vector))
+        # _get_embedding returns a tuple (LRU-cache friendly); convert for comparison
+        result_arr = np.array(result)
+        np.testing.assert_array_almost_equal(result_arr, np.array(fake_vector))
 
     def test_calls_ef_with_list(self):
-        with patch("app.agents.score_agent._ef") as mock_ef:
-            mock_ef.return_value = [[0.0]]
+        _get_embedding.cache_clear()
+        with patch("app.agents.score_agent.get_ef") as mock_get_ef:
+            mock_ef = MagicMock(return_value=[[0.0]])
+            mock_get_ef.return_value = mock_ef
             _get_embedding("hello")
         mock_ef.assert_called_once_with(["hello"])
 
@@ -175,21 +180,19 @@ class TestScoreLLMDimensions:
 
     def test_returns_llm_score_output(self, sample_jd):
         parsed = self._make_llm_score_output()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = MagicMock(schema_matched=True, parsed=parsed)
-
-        result = _score_llm_dimensions(mock_client, "\\latex{}", sample_jd)
+        with patch("app.agents.score_agent.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=True, parsed=parsed)
+            result = _score_llm_dimensions("\\latex{}", sample_jd)
 
         assert isinstance(result, LLMScoreOutput)
         assert result.ats_friendliness.score == 80
         assert result.resume_quality.score == 75
 
     def test_schema_mismatch_raises(self, sample_jd):
-        mock_client = MagicMock()
-        mock_client.generate.return_value = MagicMock(schema_matched=False, parsed=None)
-
-        with pytest.raises(ValueError, match="schema"):
-            _score_llm_dimensions(mock_client, "\\latex{}", sample_jd)
+        with patch("app.agents.score_agent.generate_for_task") as mock_gtf:
+            mock_gtf.return_value = MagicMock(schema_matched=False, parsed=None)
+            result = _score_llm_dimensions("\\latex{}", sample_jd)
+        assert result is None
 
 
 # ── Full pipeline ─────────────────────────────────────────────────────────────
@@ -216,17 +219,15 @@ class TestScore:
 
     def test_returns_resume_score(self, sample_jd):
         llm_out = self._make_llm_score_output()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = MagicMock(schema_matched=True, parsed=llm_out)
-
         embedding = np.array([1.0, 0.0])
-        with patch("app.agents.score_agent._get_embedding", return_value=embedding):
+        with patch("app.agents.score_agent._get_embedding", return_value=embedding), \
+             patch("app.agents.score_agent._score_llm_dimensions", return_value=llm_out), \
+             patch("app.agents.score_agent._score_cache", {}):
             result = score(
                 app_id=1,
                 resume_id=1,
                 resume_latex=r"\textbf{Python} Docker",
                 jd=sample_jd,
-                llm=mock_client,
             )
 
         assert isinstance(result, ResumeScore)
@@ -239,28 +240,26 @@ class TestScore:
         embedding = np.array([1.0, 0.0])
 
         with patch("app.agents.score_agent._get_embedding", return_value=embedding), \
-             patch("app.agents.score_agent._llm") as mock_llm:
-            mock_llm.generate.return_value = MagicMock(schema_matched=True, parsed=llm_out)
+             patch("app.agents.score_agent._score_llm_dimensions", return_value=llm_out) as mock_score, \
+             patch("app.agents.score_agent._score_cache", {}):
             result = score(app_id=2, resume_id=2, resume_latex=r"\item Python", jd=sample_jd)
 
         assert isinstance(result, ResumeScore)
-        mock_llm.generate.assert_called_once()
+        mock_score.assert_called_once()
 
     def test_custom_weights_applied(self, sample_jd):
         """With keyword weight=1.0 and others=0.0, overall must equal keyword score."""
         llm_out = self._make_llm_score_output()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = MagicMock(schema_matched=True, parsed=llm_out)
-
         custom_weights = {"ats_friendliness": 0.0, "keyword_match": 1.0, "resume_quality": 0.0}
         embedding = np.array([1.0, 0.0])
 
-        with patch("app.agents.score_agent._get_embedding", return_value=embedding):
+        with patch("app.agents.score_agent._get_embedding", return_value=embedding), \
+             patch("app.agents.score_agent._score_llm_dimensions", return_value=llm_out), \
+             patch("app.agents.score_agent._score_cache", {}):
             result = score(
                 app_id=1, resume_id=1,
                 resume_latex=r"\textbf{Python} Docker",
                 jd=sample_jd,
-                llm=mock_client,
                 weights=custom_weights,
             )
 
@@ -270,17 +269,15 @@ class TestScore:
     def test_missing_keywords_populate_dimension_scores(self, sample_jd):
         """Required skills absent from resume appear in missing_keywords and in the KEYWORD_MATCH dimension suggestions."""
         llm_out = self._make_llm_score_output()
-        mock_client = MagicMock()
-        mock_client.generate.return_value = MagicMock(schema_matched=True, parsed=llm_out)
-
         embedding = np.array([1.0, 0.0])
         # resume text contains none of the required skills
-        with patch("app.agents.score_agent._get_embedding", return_value=embedding):
+        with patch("app.agents.score_agent._get_embedding", return_value=embedding), \
+             patch("app.agents.score_agent._score_llm_dimensions", return_value=llm_out), \
+             patch("app.agents.score_agent._score_cache", {}):
             result = score(
                 app_id=1, resume_id=1,
                 resume_latex=r"JavaScript Node.js Ruby",
                 jd=sample_jd,
-                llm=mock_client,
             )
 
         assert len(result.missing_keywords) == len(sample_jd.required_skills)

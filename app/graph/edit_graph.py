@@ -46,6 +46,34 @@ log = get_logger(__name__)
 
 
 # ======================================================================
+# Bullet parsing helper
+# ======================================================================
+
+import re as _re
+
+def _extract_bullets(content_latex: str) -> list[dict]:
+    """
+    Parse \\item lines from LaTeX content.
+
+    Returns a list of dicts:
+        {"index": int, "latex": str, "text": str}
+
+    Matches each \\item block up to (but not including) the next \\item
+    or the end of the string.  Works for both bare \\item and those inside
+    an itemize environment.
+    """
+    bullets = []
+    for i, m in enumerate(_re.finditer(
+        r'(\\item\b.*?)(?=\\item\b|\Z)', content_latex, _re.DOTALL
+    )):
+        raw  = m.group(0).strip()
+        text = _re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', raw)  # strip simple cmds
+        text = _re.sub(r'[\\{}]', '', text).strip()
+        bullets.append({"index": i, "latex": raw, "text": text})
+    return bullets
+
+
+# ======================================================================
 # Helper: rebuild EditAgent from serialised state
 # ======================================================================
 
@@ -82,6 +110,15 @@ def _rebuild_agent(state: EditGraphState):
 
 def _serialise_cycle(agent) -> dict:
     return agent.editing_cycle.model_dump()
+
+
+def _apply_bullet_drops(content: str, drops: list[str]) -> str:
+    """Remove exact \\item lines from LaTeX content and tidy whitespace."""
+    result = content
+    for bullet in drops or []:
+        result = result.replace(bullet, "")
+    result = _re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
 
 
 # ======================================================================
@@ -166,25 +203,42 @@ def node_parse_and_retrieve(state: EditGraphState) -> dict:
 def node_item_selection(state: EditGraphState) -> dict:
     """
     Pause and surface the ranked_items to the user.
-    The user sends back a list of items they want included.
+    Each item is enriched with a `bullets` list so the UI can show
+    individual bullet points and let the user pre-filter them.
 
     Interrupt payload:
         {
             "type": "item_selection",
-            "ranked_items": [...],          # full list from retriever
+            "ranked_items": [
+                {..., "bullets": [{"index": int, "latex": str, "text": str}, ...]}
+            ],
         }
 
     Expected resume value (from client):
         {
-            "selected_items": [...]         # subset of ranked_items
+            "selected_items": [...],   # subset of ranked_items
+            "bullet_filter":  {        # optional — omit to keep all bullets
+                "achievements":              [1, 2],   # keep only indices 1 and 2
+                "experience__CompanyName":   [0, 1, 2],
+            }
         }
     """
+    enriched = []
+    for item in state["ranked_items"]:
+        rows    = item.get("rows", [])
+        best    = next((r for r in rows if r and r.get("content_latex")), {})
+        latex   = best.get("content_latex", "") or ""
+        bullets = _extract_bullets(latex)
+        enriched.append({**item, "bullets": bullets})
+
     user_response: dict = interrupt({
         "type":         "item_selection",
-        "ranked_items": state["ranked_items"],
+        "ranked_items": enriched,
     })
     return {
         "selected_items": user_response.get("selected_items", state["ranked_items"]),
+        "bullet_filter":  user_response.get("bullet_filter"),
+        "quick_resume":   bool(user_response.get("quick_resume", False)),
         "stage": "items_selected",
     }
 
@@ -197,7 +251,10 @@ def node_build_edit_state(state: EditGraphState) -> dict:
     log.info("[graph] build_edit_state")
     try:
         parsed_jd   = ParsedJD(**state["parsed_jd"])
-        edit_state  = pl.build_starting_edit_state(state["selected_items"])
+        edit_state  = pl.build_starting_edit_state(
+            state["selected_items"],
+            bullet_filter=state.get("bullet_filter"),
+        )
         cycle_id    = state.get("cycle_id", 1)
         agent       = pl.build_edit_agent(edit_state, parsed_jd, cycle_id)
 
@@ -233,15 +290,16 @@ def node_generate_suggestions(state: EditGraphState) -> dict:
         agent              = _rebuild_agent(state)
         feedback           = state.get("score_feedback")
         custom_instruction = state.get("custom_instruction")
+        thread_id          = state.get("thread_id")
 
         # Combine session-level custom instruction with score feedback (if any)
         instruction_parts = [p for p in [custom_instruction, feedback] if p]
         agent.global_instruction = "\n\n".join(instruction_parts)
 
         if feedback:
-            pl.generate_suggestions_with_score_feedback(agent, feedback)
+            pl.generate_suggestions_with_score_feedback(agent, feedback, thread_id=thread_id)
         else:
-            pl.generate_suggestions(agent)
+            pl.generate_suggestions(agent, thread_id=thread_id)
 
         # Rebuild sections_pending from selected_items, skipping anything the
         # user has dropped (dropped_items accumulates across the whole session).
@@ -306,11 +364,13 @@ def node_section_review(state: EditGraphState) -> dict:
         current_latex     = sec_obj.updated_section   if sec_obj else ""
         lines_to_change   = sec_obj.lines_to_change   if sec_obj else []
         suggested_changes = sec_obj.suggested_changes if sec_obj else []
+        bullets_dropped   = sec_obj.bullets_dropped   if sec_obj else []
     else:
         _, item_obj = sec_state.get_item(current["section"], current["item"])
         current_latex     = item_obj.updated_section   if item_obj else ""
         lines_to_change   = item_obj.lines_to_change   if item_obj else []
         suggested_changes = item_obj.suggested_changes if item_obj else []
+        bullets_dropped   = item_obj.bullets_dropped   if item_obj else []
 
     # Build per-section history for the UI (root → current node, deduplicated by content)
     history: list[dict] = []
@@ -337,6 +397,8 @@ def node_section_review(state: EditGraphState) -> dict:
         "current_latex":     current_latex,
         "lines_to_change":   lines_to_change,
         "suggested_changes": suggested_changes,
+        # bullets_dropped: LLM-suggested removals; user can override keep/drop in proposal
+        "bullets_dropped":   bullets_dropped,
         "can_go_back":       len(reviewed) > 0,
         "section_index":     len(reviewed),          # 0-based index in queue
         "total_sections":    len(reviewed) + len(pending),
@@ -541,7 +603,51 @@ def node_apply_edit(state: EditGraphState) -> dict:
                         "stage": "edit_applied",
                     }
 
-            # Full accept — all changes already applied in cycle, nothing to rebuild.
+            # Full accept — changes are already in the cycle.
+            # Apply any user bullet-drop decisions on top.
+            bullet_decisions = review.get("bullet_decisions") or {}
+            final_drops = bullet_decisions.get("drop") or []
+            if final_drops:
+                from app.models.edit import SectionEditState, ItemEditState
+                agent2    = _rebuild_agent(state)
+                cycle2    = agent2.editing_cycle
+                sec_name2  = review["section"]
+                item_name2 = review.get("item")
+                if item_name2:
+                    _, obj2 = cycle2.current_state.get_item(sec_name2, item_name2)
+                    if obj2:
+                        new_content2 = _apply_bullet_drops(obj2.updated_section, final_drops)
+                        updated2 = ItemEditState(
+                            section_name=sec_name2, item_name=item_name2,
+                            section_previous_state=obj2.section_previous_state,
+                            lines_to_change=obj2.lines_to_change,
+                            suggested_changes=obj2.suggested_changes,
+                            updated_section=new_content2,
+                            bullets_dropped=final_drops,
+                        )
+                        items2 = list(getattr(cycle2.current_state, sec_name2) or [])
+                        new_items2 = [updated2 if (it and it.item_name == item_name2) else it for it in items2]
+                        cycle2.push(cycle2.current_state.model_copy(update={sec_name2: new_items2}),
+                                    action="bullet_drop", section_name=sec_name2)
+                else:
+                    obj2 = cycle2.current_state.get_section(sec_name2)
+                    if obj2:
+                        new_content2 = _apply_bullet_drops(obj2.updated_section, final_drops)
+                        updated2 = SectionEditState(
+                            section_name=sec_name2,
+                            section_previous_state=obj2.section_previous_state,
+                            lines_to_change=obj2.lines_to_change,
+                            suggested_changes=obj2.suggested_changes,
+                            updated_section=new_content2,
+                            bullets_dropped=final_drops,
+                        )
+                        cycle2.push(cycle2.current_state.set_section(sec_name2, updated2),
+                                    action="bullet_drop", section_name=sec_name2)
+                return {
+                    "edit_cycle_dict":   _serialise_cycle(agent2),
+                    "sections_reviewed": reviewed + [current_section],
+                    "stage": "edit_applied",
+                }
             return {
                 "sections_reviewed": reviewed + [current_section],
                 "stage": "edit_applied",
@@ -640,6 +746,11 @@ def route_after_error(state: EditGraphState) -> str:
     return "continue"
 
 
+def route_after_build_edit_state(state: EditGraphState) -> str:
+    """Skip suggestion/review cycle when user asked for a quick resume."""
+    return "quick" if state.get("quick_resume") else "full"
+
+
 def route_after_review_or_done(state: EditGraphState) -> str:
     """After apply_edit: more sections pending? Loop; otherwise score."""
     if state.get("sections_pending"):
@@ -674,7 +785,15 @@ def build_edit_graph() -> StateGraph:
     # Linear path until item selection
     g.add_edge("parse_and_retrieve", "item_selection")
     g.add_edge("item_selection", "build_edit_state")
-    g.add_edge("build_edit_state", "generate_suggestions")
+    # Quick resume: skip suggestions + review, go straight to scoring
+    g.add_conditional_edges(
+        "build_edit_state",
+        route_after_build_edit_state,
+        {
+            "quick": "score_resume",
+            "full":  "generate_suggestions",
+        },
+    )
     g.add_edge("generate_suggestions", "section_review")
     g.add_edge("section_review", "apply_edit")
 

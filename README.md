@@ -1,18 +1,78 @@
 # Job Assistant
 
-An AI-powered resume tailoring and job application assistant. Upload your resume, paste a job description, and the system retrieves the most relevant sections from your resume history, lets you review AI-suggested edits section by section, scores the result, and generates a cover letter, HR email, and outreach message.
+An AI-powered resume tailoring and job application assistant. Add your resume, paste a job description (or a job-post URL), and the system retrieves the most relevant sections from your resume history, lets you review AI-suggested edits section by section, scores the result, generates a cover letter / HR email / outreach message, and tracks the application — all from a React frontend over a FastAPI + LangGraph backend.
+
+---
+
+## Architecture
+
+> Rendered diagram (GitHub renders Mermaid natively; in VS Code use the *Markdown Preview Mermaid Support* extension).
+
+```mermaid
+flowchart TB
+    FE["Frontend · Next.js / React<br/>session UI · live SSE stream · resume manager"]
+    BE["Backend · FastAPI<br/>edit · resume · jd · generate · score<br/>keys · library · auth · applications · skills"]
+    LG["Agentic Core · LangGraph StateGraph<br/>SQLite checkpointer — restart-safe sessions"]
+    PIPE["Core<br/>pipeline · jd_parser · resume_parser<br/>retriever — CombMNZ / CombSUM fusion rerank<br/>resume_builder — Jinja2 · gen_cache · stream"]
+    AG["Agents<br/>edit · score · generator"]
+    LLM["LLM · infrakit LLMClient<br/>Gemini → Groq failover · key rotation<br/>quota tracking · content-hash caching"]
+    SQL[("SQLite<br/>metadata · sessions · versions · caches")]
+    VDB[("ChromaDB<br/>section + JD embeddings · all-mpnet-base-v2")]
+
+    FE -->|REST + SSE| BE --> LG
+    LG --> AG
+    LG --> PIPE
+    PIPE --> LLM
+    PIPE --> SQL
+    PIPE --> VDB
+
+    subgraph FLOW["LangGraph edit flow   ( * = human-in-the-loop interrupt )"]
+      direction LR
+      A["parse_and_retrieve"] --> B["item_selection *"] --> C["suggest<br/>parallel fan-out → SSE"] --> D["section_review *"] --> E["score"] --> F["refine / finish"]
+    end
+    LG -.-> FLOW
+```
+
+## Workflow
+
+End-to-end session flow, including back-navigation, the refine loop, and the **planned**
+adaptive feedback loop (dashed amber) that learns your editing style over time.
+
+```mermaid
+flowchart TD
+    START([Start session]) --> PARSE["Parse JD + resume<br/>retrieve best sections (RAG + rerank)"]
+    PARSE --> SEL["Item selection<br/>pick sections + bullets"]
+    SEL --> SUG["LLM suggestions<br/>per-section parallel fan-out → SSE"]
+    SUG --> REV{"Section review<br/>accept · reject · paraphrase ·<br/>custom instruction · another"}
+    REV -->|next section| SUG
+    REV -->|back to previous section| REV
+    REV -->|all sections done| SCORE["Score<br/>keyword · ATS · quality"]
+    SCORE --> RF{Refine or finish?}
+    RF -->|refine — re-run with score feedback| SUG
+    RF -->|finish| GEN["Generate docs<br/>cover letter · HR email · outreach"]
+    GEN --> SAVE[("Persist session + item versions<br/>save resume variant to library")]
+
+    %% Adaptive feedback loop (planned)
+    REV -. logs accept / reject / custom edits .-> FB[("edit_feedback store<br/>(planned)")]
+    FB -. every N sessions .-> SP["StyleProfileAgent — infers tone,<br/>verbs, bullet length (planned)"]
+    SP -. injects style profile into prompts .-> SUG
+
+    classDef planned stroke-dasharray:5 5,fill:#fff7e6,stroke:#d48806;
+    class FB,SP planned;
+```
 
 ---
 
 ## Features
 
 ### Resume Parsing & Storage
-- Parse a `.tex` resume with an LLM — extracts structured sections (experience, projects, skills, education, achievements, coursework)
+- Parse a `.tex` resume with an LLM — extracts structured sections (experience, projects, skills, education, achievements, coursework). Manual entry is also supported.
 - Each section and section-item is stored in SQLite and embedded into ChromaDB for semantic retrieval
 - Multiple resume versions for the same user are supported; the system automatically picks the most JD-relevant version of each section
 
 ### JD Parsing
 - Extracts role, company, required skills, nice-to-have skills, and responsibilities from raw JD text
+- **JD from URL** — paste a job-post link and the JD text is extracted automatically (Jina Reader)
 - De-duplicates JDs by content hash so parsing only runs once per unique JD
 - Embeds the JD into ChromaDB for retrieval queries
 
@@ -23,13 +83,14 @@ An AI-powered resume tailoring and job application assistant. Upload your resume
 
 ### Interactive Editing Session (LangGraph)
 - Section-by-section AI edit suggestions with side-by-side diff view
-- LLM returns **all improvable lines** per section (not just the most obvious one), giving more comprehensive suggestions per call
-- **Per-change selection** — each suggested line change has its own checkbox; accept the ones you want and skip the rest rather than accepting or rejecting the whole section at once. The side-by-side preview updates live to reflect your selection
+- Suggestions are generated by a **per-section parallel fan-out** and **streamed live over SSE** as each section completes
+- LLM returns **all improvable lines** per section (not just the most obvious one)
+- **Per-change selection** — each suggested line change has its own checkbox; accept the ones you want and skip the rest. The preview updates live to reflect your selection
 - Actions per section: **Accept** (all or selected changes), **Reject**, **Paraphrase**, **Custom instruction**, **Another suggestion**
 - Full edit history per section with one-click restore to any previous version (including partial-accept snapshots)
 - Back-navigation to re-review previous sections
-- Multi-cycle support: after reviewing all sections the system scores the result, then offers a **Refine** pass (re-runs LLM with score feedback) or **Finish**
-- LLM suggestions use `\textbf{}` only inside experience and project bullet points — never in the skills section, where bolding adds no value
+- Multi-cycle support: after all sections the system scores the result, then offers a **Refine** pass (re-runs the LLM with score feedback) or **Finish**
+- Sessions are checkpointed to SQLite, so they **survive server restarts** and can be reopened later
 
 ### Resume Scoring
 - Three dimensions: **Keyword Match** (coverage + embedding similarity), **ATS Friendliness** (LLM), **Resume Quality** (LLM)
@@ -38,22 +99,47 @@ An AI-powered resume tailoring and job application assistant. Upload your resume
 
 ### Document Generation
 - Generate **Cover Letter**, **HR Email**, and **Outreach Message** at any point:
-  - **Quick Generate (welcome screen)** — skips editing entirely, uses JD-similarity to auto-select best sections
-  - **Quick Generate (post-parse)** — after JD is parsed and sections are retrieved, generate without entering the edit loop
+  - **Quick Generate** — skip editing entirely; uses JD-similarity to auto-select the best sections
   - **Session Generate** — generate using the tailored resume from an active editing session
   - **Post-session Generate** — generate after finishing the editing session
-- All document types are generated **in parallel** (ThreadPoolExecutor) — requesting Cover Letter + Email + Outreach together takes no longer than the slowest single generation
-- **Generation cache** — results are cached in SQLite keyed by a hash of `(JD, resume, type, instruction, no_jd)`. Generating Email first and then requesting all three skips the Email LLM call entirely and only generates the remaining two
+- All document types are generated **in parallel** (ThreadPoolExecutor) — requesting all three takes no longer than the slowest single generation
+- **Generation cache** — results are cached in SQLite keyed by a hash of `(JD, resume, type, instruction, no_jd)`
 
-### Live Resume Layout Customisation
-- Available at the end of an editing session (Refine / Finish screen)
-- Adjust **section order** (↑ / ↓ per section), **font size** (10 / 11 / 12 pt), **section spacing**, and **item spacing**
-- Click "Build Preview" to see the rendered PDF preview and download `.tex` / `.pdf`
+### Resume Library & Variants
+- Save any tailored resume as a named **variant** to a personal library
+- **Search the library by JD** — ranks saved variants by embedding similarity to a new job
+- Download any variant as `.tex` or `.pdf`
+
+### Templates & Layout
+- **Jinja2 template engine** decouples resume content from presentation
+- Multiple templates: **Classic** (FontAwesome header) and **ATS Minimal** (plain, scanner-safe)
+- Live layout controls on the resume detail and session-finish screens: **template**, **section order**, **font size**, **margins** — with an instant PDF preview, then download `.tex` / `.pdf`
+
+### Bullet-Level Granularity
+- Flat sections and atomic items split into individual bullets, each embedded separately
+- Pre-LLM bullet filter (send only selected bullets) + LLM-suggested bullet drops
+- Per-bullet keep/drop decisions during section review
+
+### One-Page Optimizer
+- Automatic drop-loop + condensation to fit a target page count
+- Compiles, counts pages, and removes lowest-ranked items until it fits
+
+### Authentication
+- Google OAuth (JWT in an httpOnly cookie); dev mode falls back to a fixed user id
+
+### Application Tracker (Kanban)
+- Track each application: **Applied → Phone Screen → Technical → Offer / Rejected**
+- Each card links the resume variant + generated documents used, with follow-up dates
+
+### Job Intelligence
+- **Skill-gap analysis** — required skills across all your JDs vs. your resume skills, ranked by frequency
+- **Interview prep** — likely questions + talking points grounded in your resume against the JD
+- **LinkedIn generator** — About / Headline / Experience bullets via the same JD-tailoring logic
 
 ### Full LaTeX Preview
-- Compile the resume to PDF at any point during or after editing
-- Rendered as a PNG image in the browser; falls back to syntax-highlighted LaTeX source if `pdflatex` is not installed
-- **Compile cache** — identical LaTeX is never sent to `pdflatex` twice in the same session; compilation results are cached by content hash via `@st.cache_data`
+- Compile the resume to PDF at any point during or after editing (`GET /edit/{tid}/preview`, `GET /resume/{id}/preview`)
+- Rendered inline in the browser (PDF iframe); `.tex` / `.pdf` export available at every stage
+- **Compile cache** — identical LaTeX is never sent to `pdflatex` twice; results are cached by content hash
 
 ### Performance & Caching
 
@@ -62,11 +148,23 @@ All expensive operations are cached to minimise repeated LLM and compute calls:
 | Layer | Cache type | Key |
 |---|---|---|
 | Document generation | SQLite (persistent, cross-session) | SHA-256 of `(JD, resume, type, instruction, no_jd)` |
+| Edit suggestions | SQLite (persistent) | SHA-256 of `(resume_latex, jd_hash)` |
 | Resume scoring | In-memory LRU (64 entries) | SHA-256 of `(resume_latex, jd)` |
 | Sentence-transformer embeddings | `functools.lru_cache` (256 entries) | Embedding input text |
 | ChromaDB retrieval | In-memory dict (process lifetime) | `(job_id, sorted resume_ids)` |
-| LaTeX → PDF compilation | Streamlit `@st.cache_data` | Full LaTeX string |
-| JD parsing | SQLite (via raw + parsed content hash) | Built into `JDParser.run()` |
+| LaTeX → PDF compilation | In-process, by content hash | Full LaTeX string |
+| JD parsing | SQLite (raw + parsed content hash) | Built into `JDParser.run()` |
+
+---
+
+## Roadmap (planned / in progress)
+
+- **Adaptive writing style** — log every accept / reject / custom-instruction decision; a `StyleProfileAgent`
+  infers your style (tone, action verbs, bullet length) after every few sessions and injects it into all edit
+  prompts. This is the dashed amber loop in the [Workflow](#workflow) diagram.
+- **Job feed / recommendations** — surface matching jobs from your stored skills + JD history, ranked by resume-fit score.
+- **Browser extension** — sidebar on LinkedIn / Indeed that extracts the JD and quick-generates in place.
+- **Email-to-JD**, **salary-range lookup**, and **PWA + mobile install / public hosting**.
 
 ---
 
@@ -74,13 +172,15 @@ All expensive operations are cached to minimise repeated LLM and compute calls:
 
 | Tool | Purpose |
 |---|---|
-| Python ≥ 3.13 | Runtime |
-| [uv](https://docs.astral.sh/uv/) | Package manager (replaces pip/venv) |
-| MiKTeX or TeX Live | LaTeX compilation for PDF preview (optional) |
+| Python ≥ 3.13 | Backend runtime |
+| [uv](https://docs.astral.sh/uv/) | Python package manager (replaces pip/venv) |
+| Node.js ≥ 18 | Frontend (Next.js) |
+| MiKTeX or TeX Live | LaTeX → PDF compilation (optional — preview / export) |
 
-API keys required in `.env`:
-- `GEMINI_API_KEY` — used for all LLM calls (parsing, editing, scoring, generation)
-- `HUGGING_FACE_TOKEN` — used for the `all-mpnet-base-v2` sentence-transformer embedding model
+API keys in `.env`:
+- `GEMINI_API_KEY` — primary LLM (parsing, editing, scoring, generation)
+- `GROQ_API_KEY` — optional fallback provider for rate-limit overflow
+- `HUGGING_FACE_TOKEN` — for the `all-mpnet-base-v2` sentence-transformer embeddings
 
 ---
 
@@ -95,14 +195,15 @@ cd job-assistant
 cp .env.example .env
 # Edit .env — set GEMINI_API_KEY, HUGGING_FACE_TOKEN, BASE_DIR, etc.
 
-# 3. Install dependencies
+# 3. Install backend dependencies
 uv sync
 
-# 4. Initialise the database
+# 4. Initialise the database and run migrations
 uv run python db/init_db.py
-
-# 5. Run any pending migrations
 uv run python db/migrate.py
+
+# 5. Install frontend dependencies
+cd frontend && npm install && cd ..
 ```
 
 ---
@@ -115,45 +216,47 @@ Open two terminals:
 # Terminal 1 — FastAPI backend
 uv run uvicorn app.api.main:app --reload
 
-# Terminal 2 — Streamlit frontend
-uv run streamlit run streamlit_app.py
+# Terminal 2 — Next.js frontend
+cd frontend
+npm run dev
 ```
 
-The Streamlit UI is available at `http://localhost:8501`.
-The API docs (Swagger) are at `http://localhost:8000/docs`.
+- Frontend: `http://localhost:3000`
+- API docs (Swagger): `http://localhost:8000/docs`
+
+> **Open the app at `http://localhost:3000`** — not your machine's LAN IP. The frontend calls the
+> backend at `http://localhost:8000`, so loading the UI from a different host or device makes those
+> calls resolve to the wrong machine and every page hangs on loading.
 
 ---
 
 ## How to Use
 
-### First time — upload your resume
-1. In the sidebar, select **"Upload new .tex file"** and upload your LaTeX resume.
-2. Paste the job description into the **"Job Description"** text area.
-3. Click **"🔍 Parse JD & Resume"**.
+### 1. Add your resume — `/resume/new`
+- **Upload** a `.tex` file (the LLM parses it into structured sections) or **enter manually**.
+- Review/edit the parsed personal info + sections, then **Save** to your library.
 
-### Subsequent jobs — use your saved profile
-1. In the sidebar, select **"Use profile from DB"** and choose your candidate profile.
-2. Paste the job description.
-3. Click **"🔍 Parse JD & Resume"**.
+### 2. Start a tailoring session — `/session/new`
+- Paste a job description, or a job-post **URL** (the JD is extracted automatically), and pick a saved resume.
+- The system parses the JD, retrieves your most JD-relevant sections, and opens the editing loop.
 
-### After parsing — choose your path
-The system retrieves the most relevant resume sections and shows them with relevance scores. You now have two options:
+### 3. Review & edit — `/session/[threadId]`
+- Pick the sections / bullets to include, then review LLM suggestions section by section
+  (accept / reject / paraphrase / custom instruction / another), with live diff and per-change selection.
+- Suggestions stream in as they are generated (SSE).
 
-**✨ Quick Generate tab**
-- Select document types (Cover Letter, HR Email, Outreach Message)
-- Click **"Generate Now"** — done in seconds, no editing required
+### 4. Score, refine, finish
+- View the ATS / keyword / quality score, optionally **Refine** (re-run with score feedback), then **Finish**.
+- Customise template + layout, save the result as a **variant**, and download `.tex` / `.pdf`.
 
-**📝 Start Editing Session tab**
-- Click **"Start Editing Session"** to enter the interactive editing loop
-- Review each section one at a time; accept, reject, paraphrase, or give a custom instruction
-- After all sections: view your score, optionally **Refine** (re-run with score feedback), then **Finish**
-- In the **Refine / Finish** screen: preview the resume, customise the layout, and generate cover letter / email / outreach
+### 5. Generate documents
+- At any point, generate a **cover letter**, **HR email**, and **outreach message** — individually or all in parallel.
 
-### Welcome screen Quick Generate
-If you just want to generate documents without any parsing step at all:
-1. Select a saved profile in the sidebar
-2. Paste the JD
-3. On the welcome screen, open the **✨ Quick Generate** tab and click **"Generate Now"**
+### Other pages
+- `/resume/library` — saved variants, JD-based search, download
+- `/tracker` — Kanban application tracker
+- `/skills` — skill-gap analysis across your JD history
+- `/settings` — API-key management + per-key usage dashboard
 
 ---
 
@@ -175,96 +278,55 @@ uv run python tests/resetdb.py
 ```
 job-assistant/
 │
-├── streamlit_app.py          # Entire Streamlit UI — sidebar, all interrupt screens,
-│                             #   welcome / quick-generate, layout customiser
+├── frontend/                 # Next.js + React (TypeScript, Tailwind) UI
+│   └── src/
+│       ├── app/              # routes: / · session · sessions · resume ·
+│       │                     #   tracker · skills · settings · login
+│       ├── components/       # session / resume / layout / ui components
+│       └── lib/              # api.ts · auth.ts · types.ts
 │
-├── main.py                   # Thin entry point (imports FastAPI app)
+├── main.py                   # Thin entry point (imports the FastAPI app)
 │
 ├── app/
 │   ├── api/
-│   │   ├── main.py           # FastAPI app creation, router registration, /health
+│   │   ├── main.py           # FastAPI app, router registration, CORS, /health
+│   │   ├── middleware.py     # get_current_user dependency (dev fallback to user 1)
 │   │   ├── deps.py           # Shared FastAPI dependencies
-│   │   └── routes/
-│   │       ├── edit.py       # All editing-session endpoints:
-│   │       │                 #   POST /edit/start, /{tid}/resume, /{tid}/score,
-│   │       │                 #   /{tid}/preview, /{tid}/generate,
-│   │       │                 #   /{tid}/generate-from-items, /quick-generate
-│   │       ├── resume.py     # Resume upload, list, user profiles  (GET /resume/users)
-│   │       ├── jd.py         # Standalone JD parse endpoint
-│   │       ├── generate.py   # Standalone generation endpoint
-│   │       └── score.py      # Standalone score endpoint
+│   │   └── routes/           # edit · resume · jd · generate · score · keys ·
+│   │                         #   library · auth · applications · skills
 │   │
-│   ├── graph/
-│   │   ├── edit_graph.py     # LangGraph StateGraph for the editing session:
-│   │   │                     #   node_parse_and_retrieve → item_selection interrupt
-│   │   │                     #   → node_build_edit_state → node_suggest
-│   │   │                     #   → section_review interrupt (per section, per change)
-│   │   │                     #   → refine_or_finish interrupt → done
-│   │   ├── generation_graph.py  # LangGraph for batch document generation;
-│   │   │                     #   runs all requested types in parallel via
-│   │   │                     #   ThreadPoolExecutor, no human-in-the-loop
-│   │   └── state.py          # EditGraphState + GenerationGraphState TypedDicts
+│   ├── graph/                # LangGraph state machines
+│   │   ├── edit_graph.py     #   editing session (interrupts, SSE, SqliteSaver)
+│   │   ├── generation_graph.py  # parallel document generation
+│   │   ├── optimizer_graph.py   # one-page optimizer drop-loop
+│   │   └── state.py
 │   │
-│   ├── agents/
-│   │   ├── edit_agent.py     # EditAgent — holds ResumeEditCycle, calls LLM for
-│   │   │                     #   suggestions (all improvable lines per section) and
-│   │   │                     #   section edits, manages history tree
-│   │   ├── score_agent.py    # score() — keyword coverage + semantic + LLM scoring;
-│   │   │                     #   lru_cache on embeddings, in-memory score result cache
-│   │   ├── generator_agent.py# generate() — cover letter / email / outreach via LLM;
-│   │   │                     #   checks generation cache before every LLM call
-│   │   └── orchestrator.py   # High-level orchestration helpers
+│   ├── agents/               # edit_agent · score_agent · generator_agent · orchestrator
 │   │
 │   ├── core/
-│   │   ├── pipeline.py       # Thin facade over all core modules — the single
-│   │   │                     #   import used by graph nodes and API routes;
-│   │   │                     #   includes in-memory retrieval cache
-│   │   ├── gen_cache.py      # SQLite-backed generation result cache;
-│   │   │                     #   make_key() + get() + set() used by generator_agent
-│   │   ├── jd_parser.py      # JDParser — LLM extracts structured JD, saves to
-│   │   │                     #   SQLite + embeds to ChromaDB; hash-based dedup
-│   │   ├── resume_parser.py  # ResumeParser — LLM extracts structured resume,
-│   │   │                     #   saves sections/items to SQLite + ChromaDB
-│   │   ├── retriever.py      # ResumeRetriever — ChromaDB queries, two-stage
-│   │   │                     #   CombMNZ/CombSUM reranking, rank_and_filter
-│   │   └── resume_builder.py # ResumeBuilder — assembles final LaTeX from sections;
-│   │                         #   accepts section_order, font_size, spacing overrides
+│   │   ├── pipeline.py       # facade over core modules used by graph nodes / routes
+│   │   ├── jd_parser.py      # LLM JD extraction + dedup + embed
+│   │   ├── resume_parser.py  # LLM resume extraction + per-bullet embed
+│   │   ├── retriever.py      # ChromaDB queries + CombMNZ / CombSUM rerank
+│   │   ├── resume_builder.py # Jinja2 LaTeX template renderer
+│   │   ├── variant_store.py  # resume library / variants
+│   │   ├── stream.py         # per-thread SSE event queue
+│   │   ├── gen_cache.py      # SQLite generation + suggestion caches
+│   │   ├── jd_extractor.py   # JD-from-URL (Jina Reader)
+│   │   ├── chroma_client.py  # ChromaDB client
+│   │   └── embeddings.py     # sentence-transformer (all-mpnet-base-v2)
 │   │
-│   ├── models/
-│   │   ├── jd.py             # ParsedJD pydantic model
-│   │   ├── resume.py         # ParsedResume, PersonalInfo, ResumeSection, AtomicItem
-│   │   ├── edit.py           # ResumeEditState, ResumeEditCycle, SectionEditState,
-│   │   │                     #   ItemEditState
-│   │   ├── scoring.py        # ResumeScore, DimensionScore, LLMScoreOutput
-│   │   ├── generation.py     # Generation request/response models
-│   │   ├── resume_builder.py # ResumeBuilderInput
-│   │   └── retriever.py      # Retriever result models
-│   │
-│   └── utils/
-│       ├── llm.py            # LLMClient wrapper (Gemini / OpenAI), Prompt dataclass
-│       ├── logger.py         # get_logger() — structured logging setup
-│       ├── sqlite_handler.py # SQLHandler — fetch_one, fetch_table_where,
-│       │                     #   execute_raw wrappers over SQLAlchemy
-│       └── __init__.py       # Re-exports SQLHandler, get_logger
+│   ├── models/               # Pydantic models: jd · resume · edit · scoring · generation · …
+│   └── utils/                # llm (infrakit wrapper) · logger · sqlite_handler
 │
-├── config/
-│   ├── config.ini            # Config template — values injected from .env
-│   └── config.py             # get_config_dict() — loads config.ini + .env,
-│                             #   returns nested dict (cached after first call)
+├── templates/resume/         # classic.tex.j2 · ats_minimal.tex.j2  (LaTeX Jinja2)
+│
+├── config/                   # config.ini + config.py (loads .env)
 │
 ├── db/
-│   ├── schema.sql            # Full database schema (reference)
-│   ├── init_db.py            # Creates all tables from schema.sql
-│   ├── migrate.py            # Runs numbered migration files in order
-│   └── migrations/           # SQL migration files (001 … 007)
+│   ├── schema.sql · init_db.py · migrate.py
+│   └── migrations/           # 001 … 013 — sessions, item versioning, layouts,
+│                             #   resume variants, auth, applications tracker
 │
-└── tests/
-    ├── conftest.py           # Pytest fixtures (DB setup, mock clients)
-    ├── resetdb.py            # Wipes and re-initialises the test database
-    ├── test_jd_parser.py     # JDParser unit tests
-    ├── test_resume_parser.py # ResumeParser unit tests
-    ├── test_retriever.py     # ResumeRetriever unit tests
-    ├── test_edit_agent.py    # EditAgent unit tests
-    ├── test_score_agent.py   # ScoreAgent unit tests
-    └── test_generator_agent.py  # GeneratorAgent unit tests
+└── tests/                    # pytest suites (sprint0 … sprint6, route + agent tests)
 ```

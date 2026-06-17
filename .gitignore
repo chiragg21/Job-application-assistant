@@ -58,5 +58,29 @@ new_src/
 data_models/
 src/
 
+# ── Frontend (Next.js / Node) ──────────────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+frontend/out/
+frontend/build/
+.turbo/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tsbuildinfo
+next-env.d.ts
+
+# ── LaTeX build artefacts ──────────────────────────────────────────────────────
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.out.tex
+
 # ── Claude Code internal ──────────────────────────────────────────────────────
 .claude/
+
+DEVELOPMENT_PLAN.md

@@ -140,7 +140,7 @@ class TestNodeBuildEditState:
             mock_pl.build_starting_edit_state.return_value = MagicMock()
             mock_pl.build_edit_agent.return_value = _make_mock_agent()
             node_build_edit_state(state)
-        mock_pl.build_starting_edit_state.assert_called_once_with(selected)
+        mock_pl.build_starting_edit_state.assert_called_once_with(selected, bullet_filter=None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,7 +454,7 @@ class TestNodeScoreResume:
         )
         return ResumeScore(
             app_id=0, resume_id=1, overall_score=78.0,
-            ats_score=80.0, keyword_match_score=75.0, quality_score=79.0,
+            ats_friendliness_score=80.0, keyword_match_score=75.0, resume_quality_score=79.0,
             dimension_scores=[ds], missing_keywords=[],
             overall_feedback="OK",
             weights={"ats_friendliness": 0.3, "keyword_match": 0.4, "resume_quality": 0.3},
@@ -569,7 +569,12 @@ class TestNodeItemSelectionPayload:
         with patch("app.graph.edit_graph.interrupt", side_effect=_fake_interrupt):
             node_item_selection(state)
 
-        assert captured.get("ranked_items") == ranked
+        # node_item_selection enriches each item with a 'bullets' field
+        payload_items = captured.get("ranked_items", [])
+        assert len(payload_items) == len(ranked)
+        assert payload_items[0]["section_name"] == ranked[0]["section_name"]
+        assert payload_items[0]["item_name"] == ranked[0]["item_name"]
+        assert "bullets" in payload_items[0]
 
     def test_selected_items_set_from_user_response(self):
         from app.graph.edit_graph import node_item_selection

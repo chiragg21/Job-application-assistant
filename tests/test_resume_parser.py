@@ -15,10 +15,12 @@ from app.models.resume import (
 def parser(mock_sql):
     mock_chroma = MagicMock()
     mock_col    = MagicMock()
+    mock_ef     = MagicMock()
     mock_chroma.get_or_create_collection.return_value = mock_col
 
-    with patch("app.core.resume_parser.SQLHandler",          return_value=mock_sql), \
-         patch("app.core.resume_parser.chromadb.PersistentClient", return_value=mock_chroma):
+    with patch("app.core.resume_parser.SQLHandler",        return_value=mock_sql), \
+         patch("app.core.resume_parser.get_chroma_client", return_value=mock_chroma), \
+         patch("app.core.resume_parser.get_ef",            return_value=mock_ef):
         p = ResumeParser()
     p.db          = mock_sql
     p.col_resume  = mock_col

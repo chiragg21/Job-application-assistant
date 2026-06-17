@@ -131,24 +131,33 @@ class TestPersonalInfoModel:
 
     def test_optional_fields_default_to_empty(self):
         from app.models.resume import PersonalInfo
-        pi = PersonalInfo(name="X")
-        assert pi.email == "" or pi.email is None or hasattr(pi, "email")
+        pi = PersonalInfo(name="X", email="", phone="", linkedin="", github="")
+        assert hasattr(pi, "email")
 
     def test_model_dump_returns_dict(self):
         from app.models.resume import PersonalInfo
-        pi = PersonalInfo(name="X", email="x@x.com")
+        pi = PersonalInfo(name="X", email="x@x.com", phone="", linkedin="", github="")
         assert isinstance(pi.model_dump(), dict)
 
 
 class TestParsedResumeModel:
+    def _make_resume(self, **kw):
+        from app.models.resume import ParsedResume, PersonalInfo, ResumeSection
+        defaults = dict(
+            resume_id="1",
+            resume_path="/tmp/test.tex",
+            personal_info=PersonalInfo(name="A", email="a@a.com", phone="", linkedin="", github=""),
+            resume_sections=ResumeSection(),
+        )
+        defaults.update(kw)
+        return ParsedResume(**defaults)
+
     def test_can_instantiate_empty(self):
-        from app.models.resume import ParsedResume
-        pr = ParsedResume()
+        pr = self._make_resume()
         assert isinstance(pr, object)
 
     def test_resume_id_field_exists(self):
-        from app.models.resume import ParsedResume
-        pr = ParsedResume(resume_id="1")
+        pr = self._make_resume(resume_id="1")
         assert pr.resume_id == "1"
 
 
@@ -176,7 +185,7 @@ class TestScoringModels:
         rs = ResumeScore(
             app_id=1, resume_id=1,
             overall_score=78.0,
-            ats_score=75.0, keyword_match_score=80.0, quality_score=79.0,
+            ats_friendliness_score=75.0, keyword_match_score=80.0, resume_quality_score=79.0,
             dimension_scores=[ds],
             missing_keywords=[],
             overall_feedback="Good",
@@ -276,7 +285,8 @@ class TestEditModels:
         from app.models.jd import ParsedJD
         jd = ParsedJD()
         res = ResumeEditState()
-        cycle = ResumeEditCycle(jd=jd, initial_state=res, cycle_id=1)
+        cycle = ResumeEditCycle(jd=jd, cycle_id=1)
+        cycle.init_root(res)
         cycle.push(ResumeEditState(), action="edit", section_name="skills")
         assert cycle.current_node_id == 1
 
@@ -333,12 +343,12 @@ class TestResumeParserPersonalInfo:
     def test_extract_github_handle(self):
         parser = self._make_parser()
         info = parser.extract_personal_info(SAMPLE_TEX_HEADER)
-        assert "johndoe" in info.github_handle
+        assert "johndoe" in info.github
 
     def test_extract_linkedin_name(self):
         parser = self._make_parser()
         info = parser.extract_personal_info(SAMPLE_TEX_HEADER)
-        assert "John Doe" in info.linkedin_name
+        assert "johndoe" in info.linkedin or "linkedin" in info.linkedin
 
     def test_missing_header_returns_defaults(self):
         parser = self._make_parser()

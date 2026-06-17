@@ -79,20 +79,9 @@ class EditAgent:
     # Actions
     # ------------------------------------------------------------------
 
-    def _resume_suggestions(self):
-        input_str = ""
-        for sec in FLAT_SECTIONS:
-            sec_state: SectionEditState = getattr(self.editing_cycle.current_state, sec)
-            content = sec_state.updated_section if sec_state else ""
-            input_str += sec + ": " + content + "\n\n"
-        for sec in ATOMIC_SECTIONS:
-            sec_item_state: list[ItemEditState] = getattr(self.editing_cycle.current_state, sec) or []
-            input_str += sec + "-\n"
-            for item in sec_item_state:
-                if item is None:
-                    continue
-                input_str += item.item_name + ": " + item.updated_section + "\n"
-        system_prompt = f"""
+    # System prompt shared by all per-section parallel calls.
+    def _per_section_system_prompt(self) -> str:
+        return f"""
 You are an expert technical resume writer specialising in software engineering and data/ML roles.
 
 Your task is to rewrite resume bullets so they pass ATS filters AND impress human reviewers.
@@ -107,8 +96,7 @@ Your task is to rewrite resume bullets so they pass ATS filters AND impress huma
    "Achieved [result] by [action] using [method/tool]"
    Only use real numbers from the original line. Never invent metrics.
 
-3. **Mirror JD keywords naturally** — if the JD says "MLOps" and the resume says
-   "model deployment workflows", rewrite to include "MLOps". Do not force-fit every keyword.
+3. **Mirror JD keywords naturally** — do not force-fit every keyword.
 
 4. **Action verb upgrade** — replace weak openers (Worked on, Helped, Assisted, Was responsible for)
    with strong verbs (Engineered, Designed, Reduced, Automated, Deployed, Led).
@@ -119,6 +107,11 @@ Your task is to rewrite resume bullets so they pass ATS filters AND impress huma
 6. **LaTeX hygiene** — preserve all commands (\\item, \\textbf{{}}, \\href{{}}{{}}). Use \\textbf{{}}
    only inside experience/project bullets to highlight one key metric or tool per bullet.
    Never bold items in the skills section.
+
+## BULLET RELEVANCE
+Identify any `\\item` lines that are clearly irrelevant to this JD and list them in
+`bullets_to_drop`.  Use a high bar: only drop if the bullet adds no value for THIS role.
+When in doubt, leave it in — the user makes the final decision.
 
 ## HARD CONSTRAINTS
 - Do NOT invent tools, companies, metrics, or responsibilities.
@@ -132,89 +125,251 @@ Your task is to rewrite resume bullets so they pass ATS filters AND impress huma
 {self._prompt_guardrails()}
 
 ## OUTPUT SCHEMA
-{WholeLlmOutput.model_json_schema()}
+{OneLlmOutput.model_json_schema()}
 """
-        prompt = f"""
+
+    def _call_one_section(
+        self,
+        sec: str,
+        item_name: str | None,
+        content: str,
+        system_prompt: str,
+    ) -> OneLlmOutput:
+        """Make one LLM call for a single section/item. Returns OneLlmOutput."""
+        label = f"{sec}/{item_name}" if item_name else sec
+        user_prompt = f"""
 ## TASK
-Review the LaTeX sections below and suggest improved wording.
+Review this LaTeX resume section and suggest improved wording.
 
-For flat sections (education, skills, etc.) return an OneLlmOutput with name=null.
-For atomic sections (experience, projects) return one OneLlmOutput per item with
-`name` set to EXACTLY the item name shown in the input (e.g. "GIST Impact", "Job Assistant").
-Return one entry per item even when no changes are needed (use empty lists in that case).
-
-Identify ALL lines worth improving per section — return every line that can be meaningfully improved, not just the most obvious one.
 Return the exact original lines and their replacements.
-
-If no changes are needed for an item, return empty lists for that item.
+Also populate `bullets_to_drop` with any \\item lines clearly irrelevant to this JD.
+If no changes are needed, return empty lists.
 
 ## INPUT
-{input_str}
+Section: {label}
+
+{content}
 """
+        try:
+            result = generate_for_task(
+                "editing",
+                Prompt(system=system_prompt, user=user_prompt),
+                OneLlmOutput,
+            )
+            if result.schema_matched and result.parsed is not None:
+                return result.parsed
+        except Exception:
+            pass
+        return OneLlmOutput(lines_to_change=[], suggested_changes=[])
+
+    def _build_input_str(self) -> str:
+        """Build the canonical full-resume input string used as the cache key."""
+        parts = []
+        for sec in FLAT_SECTIONS:
+            sec_state = getattr(self.editing_cycle.current_state, sec)
+            content = sec_state.updated_section if sec_state else ""
+            parts.append(f"{sec}: {content}\n\n")
+        for sec in ATOMIC_SECTIONS:
+            items = getattr(self.editing_cycle.current_state, sec) or []
+            parts.append(f"{sec}-\n")
+            for item in items:
+                if item is None:
+                    continue
+                parts.append(f"{item.item_name}: {item.updated_section}\n")
+        return "".join(parts)
+
+    def _apply_whole_output_to_state(
+        self, response: WholeLlmOutput
+    ) -> "ResumeEditState":
+        """
+        Assemble a new ResumeEditState from a WholeLlmOutput (cached or freshly
+        built from parallel calls). Returns the new state and pushes it onto the
+        cycle.
+        """
+        next_state = ResumeEditState()
+        for sec in FLAT_SECTIONS:
+            cur = getattr(self.editing_cycle.current_state, sec)
+            if cur is None:
+                continue
+            sugg: OneLlmOutput = getattr(response, sec)
+            prev = cur.updated_section
+            updated = prev
+            for orig, repl in zip(sugg.lines_to_change, sugg.suggested_changes):
+                updated = updated.replace(orig, repl)
+            setattr(next_state, sec, SectionEditState(
+                section_name=sec,
+                section_previous_state=prev,
+                lines_to_change=sugg.lines_to_change,
+                suggested_changes=sugg.suggested_changes,
+                updated_section=updated,
+                bullets_dropped=sugg.bullets_to_drop,
+            ))
+        for sec in ATOMIC_SECTIONS:
+            prev_items = getattr(self.editing_cycle.current_state, sec) or []
+            item_suggs: list[OneLlmOutput] = getattr(response, sec) or []
+            _empty = OneLlmOutput(lines_to_change=[], suggested_changes=[])
+            sugg_by_name = {s.name: s for s in item_suggs if s and s.name}
+            new_sec = []
+            for i, prev_item in enumerate(prev_items):
+                if prev_item is None:
+                    continue
+                sugg = (
+                    sugg_by_name.get(prev_item.item_name)
+                    or (item_suggs[i] if i < len(item_suggs) else _empty)
+                )
+                updated = prev_item.updated_section
+                for orig, repl in zip(sugg.lines_to_change, sugg.suggested_changes):
+                    updated = updated.replace(orig, repl)
+                new_sec.append(ItemEditState(
+                    section_name=sec,
+                    item_name=prev_item.item_name,
+                    section_previous_state=prev_item.updated_section,
+                    lines_to_change=sugg.lines_to_change,
+                    suggested_changes=sugg.suggested_changes,
+                    updated_section=updated,
+                    bullets_dropped=sugg.bullets_to_drop,
+                ))
+            setattr(next_state, sec, new_sec)
+        self.editing_cycle.push(next_state, "resume_suggestion", "resume")
+        return next_state
+
+    def _resume_suggestions(self, thread_id: str | None = None) -> None:
+        """
+        Generate improvement suggestions for all resume sections.
+
+        When *thread_id* is provided, suggestions are generated in parallel
+        (one LLM call per section/item) and each result is pushed to the SSE
+        queue via app.core.stream so the frontend receives sections as they
+        complete.  When thread_id is None the same parallel approach is used
+        but without SSE push (streaming not requested).
+
+        The full result is cached as WholeLlmOutput JSON so that repeat runs
+        with the same resume + JD content return immediately.
+        """
+        import concurrent.futures
+        from app.core import stream as stream_module
+
         jd = self.editing_cycle.jd
-        jd_hash   = hashlib.sha256(
+        jd_hash = hashlib.sha256(
             json.dumps(jd.model_dump(), sort_keys=True).encode()
         ).hexdigest()[:16]
+        input_str = self._build_input_str()
         cache_key = suggestions_cache.make_key(input_str, jd_hash)
-        cached    = suggestions_cache.get(cache_key)
 
+        # ── Reset SSE queue before this pass ──────────────────────────────
+        if thread_id:
+            stream_module.reset(thread_id)
+
+        # ── Cache hit: push all sections immediately, then done ───────────
+        cached = suggestions_cache.get(cache_key)
         if cached is not None:
             response = WholeLlmOutput.model_validate_json(cached)
-        else:
-            result = generate_for_task(
-                "analysis",
-                Prompt(system=system_prompt, user=prompt),
-                WholeLlmOutput,
-            )
-            if not result.schema_matched or result.parsed is None:
-                raise ValueError("LLM response did not match WholeLlmOutput schema")
-            response: WholeLlmOutput = result.parsed
-            suggestions_cache.set(cache_key, response.model_dump_json())
+            if thread_id:
+                for sec in FLAT_SECTIONS:
+                    sugg: OneLlmOutput = getattr(response, sec)
+                    if sugg:
+                        stream_module.put(thread_id, {
+                            "type":             "section_done",
+                            "section":          sec,
+                            "item":             None,
+                            "lines_to_change":  sugg.lines_to_change,
+                            "suggested_changes": sugg.suggested_changes,
+                            "bullets_to_drop":  sugg.bullets_to_drop,
+                        })
+                for sec in ATOMIC_SECTIONS:
+                    for sugg in (getattr(response, sec) or []):
+                        if sugg:
+                            stream_module.put(thread_id, {
+                                "type":             "section_done",
+                                "section":          sec,
+                                "item":             sugg.name,
+                                "lines_to_change":  sugg.lines_to_change,
+                                "suggested_changes": sugg.suggested_changes,
+                                "bullets_to_drop":  sugg.bullets_to_drop,
+                            })
+                stream_module.put(thread_id, {"type": "done"})
+            self._apply_whole_output_to_state(response)
+            return
 
-        next_resume_state = ResumeEditState()
+        # ── Cache miss: build work units, fan out, stream results ─────────
+        # Collect (sec, item_name, content) for every present section/item.
+        units: list[tuple[str, str | None, str]] = []
         for sec in FLAT_SECTIONS:
-            current_sec_state = getattr(self.editing_cycle.current_state, sec)
-            if current_sec_state is None:
-                continue
-            sec_suggestions: OneLlmOutput = getattr(response, sec)
-            prev_state = current_sec_state.updated_section
-            updated_state = prev_state
-            for prev, new in zip(sec_suggestions.lines_to_change, sec_suggestions.suggested_changes):
-                updated_state = updated_state.replace(prev, new)
-
-            setattr(next_resume_state, sec, SectionEditState(**{"section_name": sec,
-                                               "section_previous_state": prev_state,
-                                               "lines_to_change": sec_suggestions.lines_to_change,
-                                               "suggested_changes": sec_suggestions.suggested_changes,
-                                               "updated_section": updated_state}))
+            state = getattr(self.editing_cycle.current_state, sec)
+            if state:
+                units.append((sec, None, state.updated_section))
         for sec in ATOMIC_SECTIONS:
-            sec_prev_state = getattr(self.editing_cycle.current_state, sec) or []
-            sec_item_sugg: list[OneLlmOutput] = getattr(response, sec) or []
-            # Build a name→suggestion map for reliable matching; fall back to
-            # positional index only when the LLM omits the name field.
-            _empty_sugg = OneLlmOutput(lines_to_change=[], suggested_changes=[])
-            sugg_by_name = {s.name: s for s in sec_item_sugg if s and s.name}
-            new_sec = []
-            for i, item_prev_state in enumerate(sec_prev_state):
-                if item_prev_state is None:
-                    continue
-                item_sugg = (
-                    sugg_by_name.get(item_prev_state.item_name)
-                    or (sec_item_sugg[i] if i < len(sec_item_sugg) else _empty_sugg)
+            for item in (getattr(self.editing_cycle.current_state, sec) or []):
+                if item:
+                    units.append((sec, item.item_name, item.updated_section))
+
+        if not units:
+            if thread_id:
+                stream_module.put(thread_id, {"type": "done"})
+            return
+
+        system_prompt = self._per_section_system_prompt()
+        per_section_results: dict[tuple[str, str | None], OneLlmOutput] = {}
+
+        def _call(unit: tuple[str, str | None, str]):
+            sec, item_name, content = unit
+            out = self._call_one_section(sec, item_name, content, system_prompt)
+            stream_module.put(thread_id, {
+                "type":             "section_done",
+                "section":          sec,
+                "item":             item_name,
+                "lines_to_change":  out.lines_to_change,
+                "suggested_changes": out.suggested_changes,
+                "bullets_to_drop":  out.bullets_to_drop,
+            })
+            return (sec, item_name), out
+
+        max_workers = min(len(units), 6)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_call, u): u for u in units}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    key, out = fut.result()
+                    per_section_results[key] = out
+                except Exception:
+                    sec, item_name, _ = futures[fut]
+                    per_section_results[(sec, item_name)] = OneLlmOutput(
+                        lines_to_change=[], suggested_changes=[]
+                    )
+
+        if thread_id:
+            stream_module.put(thread_id, {"type": "done"})
+
+        # ── Assemble WholeLlmOutput, cache it, apply to cycle ────────────
+        _empty = OneLlmOutput(lines_to_change=[], suggested_changes=[])
+        experience_items = [
+            it for it in (getattr(self.editing_cycle.current_state, "experience") or []) if it
+        ]
+        projects_items = [
+            it for it in (getattr(self.editing_cycle.current_state, "projects") or []) if it
+        ]
+
+        def _with_name(sec: str, item_name: str | None) -> OneLlmOutput:
+            out = per_section_results.get((sec, item_name), _empty)
+            if item_name and not out.name:
+                out = OneLlmOutput(
+                    name=item_name,
+                    lines_to_change=out.lines_to_change,
+                    suggested_changes=out.suggested_changes,
+                    bullets_to_drop=out.bullets_to_drop,
                 )
-                item_updated_state = item_prev_state.updated_section
-                for prev, new in zip(item_sugg.lines_to_change, item_sugg.suggested_changes):
-                    item_updated_state = item_updated_state.replace(prev, new)
-                new_item = ItemEditState(section_name=sec,
-                                         item_name=item_prev_state.item_name,
-                                         section_previous_state=item_prev_state.updated_section,
-                                         lines_to_change=item_sugg.lines_to_change,
-                                         suggested_changes=item_sugg.suggested_changes,
-                                         updated_section=item_updated_state)
-                new_sec.append(new_item)
-            setattr(next_resume_state, sec, new_sec)
-        
-        self.editing_cycle.push(next_resume_state, "resume_suggestion", "resume")
+            return out
+
+        response = WholeLlmOutput(
+            education=per_section_results.get(("education", None), _empty),
+            achievements=per_section_results.get(("achievements", None), _empty),
+            skills=per_section_results.get(("skills", None), _empty),
+            relevant_coursework=per_section_results.get(("relevant_coursework", None), _empty),
+            experience=[_with_name("experience", it.item_name) for it in experience_items],
+            projects=[_with_name("projects", it.item_name) for it in projects_items],
+        )
+        suggestions_cache.set(cache_key, response.model_dump_json())
+        self._apply_whole_output_to_state(response)
 
     def _paraphrase(self) -> None:
         idx = -1

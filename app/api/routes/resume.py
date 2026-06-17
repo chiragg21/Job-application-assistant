@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -363,6 +364,88 @@ def update_section_item(resume_id: int, item_id: int, req: SectionItemUpdate):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+class SectionItemCreate(BaseModel):
+    section_name:  str
+    item_name:     str | None = None
+    content_latex: str
+    item_index:    int | None = None
+
+
+@router.post("/{resume_id}/sections", response_model=SectionItem, status_code=201)
+def add_section_item(resume_id: int, req: SectionItemCreate):
+    """
+    Add a new item to a resume section.
+
+    For atomic sections (experience, projects) this creates a new item row.
+    For flat sections this is an alias for updating the whole section content.
+    The new item is marked is_latest=1 with no parent_item_id.
+    """
+    try:
+        db = SQLHandler()
+        section_row = db.fetch_one(
+            "resume_sections",
+            filters={"resume_id": resume_id, "section_name": req.section_name},
+        )
+        section_id = section_row["id"] if section_row else None
+
+        if req.item_index is None:
+            max_row = db.execute_raw(
+                "SELECT COALESCE(MAX(item_index), -1) AS mx FROM resume_section_items "
+                "WHERE resume_id = :rid AND section_name = :sec AND is_latest = 1",
+                {"rid": resume_id, "sec": req.section_name},
+            )
+            req.item_index = (max_row[0]["mx"] if max_row else -1) + 1
+
+        new_id = db.add_one("resume_section_items", {
+            "resume_id":      resume_id,
+            "section_id":     section_id,
+            "section_name":   req.section_name,
+            "item_name":      req.item_name,
+            "role_title":     "",
+            "content_latex":  req.content_latex,
+            "content_text":   req.content_latex,
+            "item_index":     req.item_index,
+            "is_master":      0,
+            "is_latest":      1,
+            "parent_item_id": None,
+        })
+        return SectionItem(
+            id=new_id,
+            section_name=req.section_name,
+            item_name=req.item_name,
+            content_latex=req.content_latex,
+            is_latest=1,
+            is_master=0,
+            item_index=req.item_index,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.delete("/{resume_id}/sections/{item_id}", status_code=204)
+def delete_section_item(resume_id: int, item_id: int):
+    """
+    Soft-delete a section item by marking it is_latest=0.
+
+    The row is kept for version history. Returns 404 if not found or already
+    superseded.
+    """
+    try:
+        db  = SQLHandler()
+        row = db.fetch_one("resume_section_items",
+                           filters={"id": item_id, "resume_id": resume_id})
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Item {item_id} not found.")
+        if not row.get("is_latest"):
+            raise HTTPException(status_code=409, detail="Item is already superseded (is_latest=0).")
+        db.update_data("resume_section_items", {"id": item_id}, {"is_latest": 0})
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Layout CRUD
 # ──────────────────────────────────────────────────────────────────────────────
@@ -492,3 +575,141 @@ def render_resume(
         media_type="text/plain",
         headers={"Content-Disposition": f'attachment; filename="{short}.tex"'},
     )
+
+
+@router.get("/{resume_id}/preview")
+def preview_resume_pdf(
+    resume_id:     int,
+    template_id:   str   | None = None,
+    section_order: str   | None = None,
+    font_size:     int   | None = None,
+    margin:        float | None = None,
+):
+    """
+    Render the resume via the Jinja2 template engine and compile to PDF.
+
+    Returns the PDF bytes with Content-Disposition: inline so the browser
+    opens it in-place. Layout params override stored layout; nothing is saved.
+
+    Requires pdflatex on PATH. Returns 501 if pdflatex is missing.
+    """
+    try:
+        order_list = section_order.split(",") if section_order else None
+        latex = _renderer.render(
+            resume_id=resume_id,
+            template_id=template_id,
+            section_order=order_list,
+            font_size=font_size,
+            margin=margin,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tex_path = Path(tmpdir) / "resume.tex"
+        pdf_path = Path(tmpdir) / "resume.pdf"
+        tex_path.write_text(latex, encoding="utf-8")
+        try:
+            result = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", "-output-directory", tmpdir, str(tex_path)],
+                capture_output=True,
+                timeout=60,
+            )
+            if not pdf_path.exists():
+                stderr = result.stderr.decode(errors="replace")[:500]
+                raise HTTPException(status_code=500, detail=f"pdflatex failed: {stderr}")
+            pdf_bytes = pdf_path.read_bytes()
+        except FileNotFoundError:
+            raise HTTPException(
+                status_code=501,
+                detail="pdflatex is not installed or not in PATH. Use /render for LaTeX source.",
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="pdflatex timed out.")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="resume_{resume_id}.pdf"'},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parse-preview (dry run) + Commit
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ParsePreviewResponse(BaseModel):
+    personal_info:    dict
+    resume_sections:  dict
+
+
+class CommitRequest(BaseModel):
+    user_id:         int
+    personal_info:   dict
+    resume_sections: dict
+
+
+class CommitResponse(BaseModel):
+    resume_id: int
+
+
+@router.post("/parse-preview", response_model=ParsePreviewResponse)
+async def parse_preview(
+    user_id: int = Form(...),
+    file: UploadFile = File(..., description="Resume file (.tex, .pdf, .docx, .txt)"),
+):
+    """
+    Dry-run parse: extract structured data from the resume file without saving.
+
+    Returns personal_info and resume_sections JSON so the frontend can show
+    a verification/editing form before the user confirms and commits.
+    """
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in _ACCEPTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Accepted: {sorted(_ACCEPTED_EXTENSIONS)}",
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = Path(tmp.name)
+
+    try:
+        parsed = pl.parse_resume_dry_run(resume_path=tmp_path)
+        return ParsePreviewResponse(
+            personal_info=parsed.personal_info.model_dump(),
+            resume_sections=parsed.resume_sections.model_dump(),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/commit", response_model=CommitResponse, status_code=201)
+def commit_resume(req: CommitRequest):
+    """
+    Commit a parsed resume (from parse-preview or manual entry) to the DB.
+
+    Saves personal_info + resume_sections to SQLite and ChromaDB, creates a
+    default layout row, and returns the new resume_id.
+    """
+    try:
+        from app.models.resume import PersonalInfo, ResumeSection
+        personal      = PersonalInfo(**req.personal_info)
+        resume_secs   = ResumeSection(**req.resume_sections)
+        resume_id     = pl.commit_resume(
+            user_id=req.user_id,
+            personal=personal,
+            resume_sections=resume_secs,
+        )
+        return CommitResponse(resume_id=resume_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

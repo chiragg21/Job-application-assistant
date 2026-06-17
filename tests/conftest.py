@@ -20,9 +20,13 @@ _mock_infrakit_logger_core = MagicMock()
 _mock_infrakit_logger_core.setup = MagicMock()
 _mock_infrakit_logger_core.get_logger = MagicMock(return_value=MagicMock())
 
+_mock_infrakit_llm_models = MagicMock()
+_mock_infrakit_llm_models.ModelStatus = MagicMock()
+
 for _name, _mod in [
     ("infrakit",                    MagicMock()),
     ("infrakit.llm",                _mock_infrakit_llm),
+    ("infrakit.llm.models",         _mock_infrakit_llm_models),
     ("infrakit.core",               MagicMock()),
     ("infrakit.core.logger",        _mock_infrakit_logger_core),
     ("infrakit.core.config",        MagicMock()),

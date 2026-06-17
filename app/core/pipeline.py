@@ -83,6 +83,41 @@ def parse_resume(resume_path: str | Path, user_id: int) -> tuple[int, ParsedResu
     return resume_id, parsed_resume
 
 
+def parse_resume_dry_run(resume_path: str | Path) -> ParsedResume:
+    """Parse a resume file without saving anything to DB or ChromaDB."""
+    parser = _get_resume_parser()
+    p = Path(resume_path)
+    suffix = p.suffix.lower()
+    if suffix == ".tex":
+        latex_code = p.read_text(encoding="utf-8")
+        personal = parser.extract_personal_info(parser._strip_comments(latex_code))
+        sections = parser.parse_sections(latex_code)
+        if not parser._has_meaningful_sections(sections):
+            raw_text = parser._clean_latex(latex_code)
+            personal, sections = parser._llm_parse_resume(raw_text)
+    else:
+        raw_text = parser._extract_raw_text(p)
+        personal, sections = parser._llm_parse_resume(raw_text)
+    return ParsedResume(
+        resume_id="preview",
+        resume_path=str(p),
+        personal_info=personal,
+        resume_sections=sections,
+    )
+
+
+def commit_resume(user_id: int, personal: PersonalInfo, resume_sections: ResumeSection) -> int:
+    """Save pre-parsed resume data (from parse_resume_dry_run) to DB + ChromaDB."""
+    parser = _get_resume_parser()
+    resume_id = parser.add_to_sql_and_chroma(
+        user_id=user_id,
+        resume_path=Path("data/resumes/uploaded.tex"),
+        personal=personal,
+        resume_sections=resume_sections,
+    )
+    return resume_id
+
+
 def extract_personal_info(resume_path: str | Path) -> PersonalInfo:
     """Read a LaTeX resume and return its PersonalInfo without any DB writes."""
     parser = _get_resume_parser()
@@ -318,18 +353,47 @@ def load_ranked_items_from_resume(resume_id: int) -> list[dict]:
 # Edit state construction
 # ------------------------------------------------------------------
 
-def build_starting_edit_state(ranked_items: list[dict]) -> ResumeEditState:
+def _filter_bullets_by_index(content_latex: str, keep_indices: list[int]) -> str:
+    """
+    Keep only the \\item lines at the given 0-based indices.
+
+    Lines that don't begin with \\item (header, preamble) are always kept.
+    Returns `content_latex` unchanged when keep_indices is empty or None.
+    """
+    import re
+    if not keep_indices:
+        return content_latex
+    bullets = list(re.finditer(r'(\\item\b.*?)(?=\\item\b|\Z)', content_latex, re.DOTALL))
+    if not bullets:
+        return content_latex
+    prefix = content_latex[:bullets[0].start()]
+    kept   = [bullets[i].group(0) for i in keep_indices if i < len(bullets)]
+    return (prefix + "".join(kept)).strip()
+
+
+def build_starting_edit_state(
+    ranked_items:  list[dict],
+    bullet_filter: dict | None = None,
+) -> ResumeEditState:
     """
     Convert rank_and_filter() output into an initial ResumeEditState.
 
     ranked_items is a list of dicts, each like:
         {"section_name": str, "item_name": str | None, "scores": [...], "rows": [db_row_dict, ...]}
 
-    Only items passed in are included — caller is responsible for
-    filtering to only user-selected items before calling this.
+    bullet_filter (optional) lets the caller pre-filter individual bullets before
+    the LLM sees them:
+        {
+            "achievements":              [1, 2],   # flat section: keep bullets at these indices
+            "experience__CompanyName":   [0, 1],   # atomic item: key = section + "__" + item_name
+        }
+
+    Only items passed in are included — caller is responsible for filtering to
+    only user-selected items before calling this.
     """
-    flat_states:   dict[str, SectionEditState]       = {}
-    atomic_states: dict[str, list[ItemEditState]]    = {s: [] for s in ATOMIC_SECTIONS}
+    bf = bullet_filter or {}
+    flat_states:   dict[str, SectionEditState]    = {}
+    atomic_states: dict[str, list[ItemEditState]] = {s: [] for s in ATOMIC_SECTIONS}
 
     for entry in ranked_items:
         sec_name  = entry["section_name"]
@@ -339,7 +403,10 @@ def build_starting_edit_state(ranked_items: list[dict]) -> ResumeEditState:
         latex     = best_row.get("content_latex", "") or ""
 
         if item_name is None:
-            # Flat section — last write wins if the same section appears twice
+            # Apply flat-section bullet filter
+            keep = bf.get(sec_name)
+            if keep is not None:
+                latex = _filter_bullets_by_index(latex, keep)
             flat_states[sec_name] = SectionEditState(
                 section_name=sec_name,
                 section_previous_state="",
@@ -348,6 +415,11 @@ def build_starting_edit_state(ranked_items: list[dict]) -> ResumeEditState:
                 updated_section=latex,
             )
         elif sec_name in atomic_states:
+            # Apply atomic-item bullet filter
+            filter_key = f"{sec_name}__{item_name}"
+            keep = bf.get(filter_key)
+            if keep is not None:
+                latex = _filter_bullets_by_index(latex, keep)
             atomic_states[sec_name].append(
                 ItemEditState(
                     section_name=sec_name,
@@ -375,32 +447,35 @@ def build_edit_agent(
     edit_state: ResumeEditState,
     parsed_jd: ParsedJD,
     cycle_id: int,
-    llm: str = "gemini",
 ) -> EditAgent:
     """Initialise EditAgent with a fresh ResumeEditCycle."""
     cycle = ResumeEditCycle(cycle_id=cycle_id, jd=parsed_jd)
-    return EditAgent(editing_cycle=cycle, resume=edit_state, usellm=llm)
+    return EditAgent(editing_cycle=cycle, resume=edit_state)
 
 
 # ------------------------------------------------------------------
 # Suggestions
 # ------------------------------------------------------------------
 
-def generate_suggestions(edit_agent: EditAgent) -> None:
-    """Trigger full resume suggestion pass (all sections in one LLM call)."""
-    edit_agent._resume_suggestions()
+def generate_suggestions(
+    edit_agent: EditAgent,
+    thread_id: str | None = None,
+) -> None:
+    """Trigger full resume suggestion pass (parallel per-section LLM calls)."""
+    edit_agent._resume_suggestions(thread_id=thread_id)
 
 
 def generate_suggestions_with_score_feedback(
     edit_agent: EditAgent,
     score_feedback: str,
+    thread_id: str | None = None,
 ) -> None:
     """
     Same as generate_suggestions but injects a score summary as a special
     instruction so the LLM focuses on the weakest areas.
     """
     edit_agent.special_instruction = score_feedback
-    edit_agent._resume_suggestions()
+    edit_agent._resume_suggestions(thread_id=thread_id)
     edit_agent.special_instruction = ""
 
 
@@ -556,13 +631,33 @@ def collapse_edit_state_to_resume(
 # Edit write-back (called at finish_session)
 # ------------------------------------------------------------------
 
+def _parse_bullets(content_latex: str) -> list[str]:
+    """Extract \\item lines from LaTeX content as a list of strings."""
+    import re
+    return [
+        m.group(0).strip()
+        for m in re.finditer(r'(\\item\b.*?)(?=\\item\b|\Z)', content_latex, re.DOTALL)
+        if m.group(0).strip()
+    ]
+
+
+def _clean_bullet_text(bullet: str) -> str:
+    """Strip LaTeX markup from a single bullet for plain-text embedding."""
+    import re
+    text = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', bullet)
+    text = re.sub(r'[\\{}]', '', text)
+    return ' '.join(text.split())
+
+
 def write_back_edited_items(state_values: dict, agent: EditAgent) -> int:
     """
     Persist changed section content from a finished edit session back to the DB.
 
-    Flat sections   → update resume_sections.content_latex in-place + re-embed.
-    Atomic sections → insert a new resume_section_items row (is_latest=1,
-                      parent_item_id=old_id), mark old row is_latest=0, re-embed.
+    Flat (plain blob) sections → update resume_sections.content_latex + re-embed blob.
+    Flat (flat_items) sections → update resume_sections blob, retire old per-bullet
+                                  rows + ChromaDB entries, insert + embed new bullets.
+    Atomic sections            → insert a new resume_section_items row (is_latest=1,
+                                  parent_item_id=old_id), mark old row is_latest=0, re-embed.
 
     Returns the number of rows written back.
     """
@@ -592,7 +687,7 @@ def write_back_edited_items(state_values: dict, agent: EditAgent) -> int:
     col_resume = _get_retriever().col_resume
     written = 0
 
-    # ── Flat sections: update in-place ───────────────────────────────────────
+    # ── Flat sections ─────────────────────────────────────────────────────────
     for sec_name in FLAT_SECTIONS:
         entry = item_map.get((sec_name, None))
         if not entry:
@@ -600,26 +695,82 @@ def write_back_edited_items(state_values: dict, agent: EditAgent) -> int:
         sec_state = getattr(current_state, sec_name, None)
         if not sec_state:
             continue
-        orig_row    = (entry.get("rows") or [{}])[0]
-        orig_id     = orig_row.get("id")
-        new_content = sec_state.updated_section or ""
+        orig_row     = (entry.get("rows") or [{}])[0]
+        orig_id      = orig_row.get("id")   # resume_sections.id
+        new_content  = sec_state.updated_section or ""
         orig_content = orig_row.get("content_latex", "") or ""
         if not orig_id or new_content == orig_content:
             continue
 
+        # Always update the resume_sections blob
         db.update_data(
             "resume_sections",
             {"id": orig_id},
             {"content_latex": new_content, "content_text": new_content},
         )
-        try:
-            col_resume.upsert(
-                documents=[new_content],
-                metadatas=[{**base_meta, "section_type": sec_name}],
-                ids=[f"res{resume_id}_{sec_name}"],
-            )
-        except Exception as exc:
-            log.warning("[writeback] chroma flat sync failed %s: %s", sec_name, exc)
+
+        section_type = orig_row.get("section_type", "flat")
+
+        if section_type == "flat_items":
+            # Retire old per-bullet rows and their ChromaDB entries, then re-embed
+            old_rows = db.execute_raw(
+                "SELECT id FROM resume_section_items WHERE section_id = :sid AND is_latest = 1",
+                {"sid": orig_id},
+            ) or []
+            old_ids = [r["id"] for r in old_rows]
+
+            if old_ids:
+                try:
+                    col_resume.delete(ids=[f"sec_item_{bid}" for bid in old_ids])
+                except Exception as exc:
+                    log.warning("[writeback] chroma delete old bullets failed %s: %s", sec_name, exc)
+                for bid in old_ids:
+                    db.update_data("resume_section_items", {"id": bid}, {"is_latest": 0})
+
+            # Insert new bullet rows and embed them
+            new_bullets = _parse_bullets(new_content)
+            if new_bullets:
+                docs, metas, chroma_ids = [], [], []
+                for idx, bullet in enumerate(new_bullets):
+                    clean = _clean_bullet_text(bullet)
+                    new_bid = db.add_one("resume_section_items", {
+                        "resume_id":      resume_id,
+                        "section_id":     orig_id,
+                        "section_name":   sec_name,
+                        "item_name":      None,
+                        "role_title":     "",
+                        "content_latex":  bullet,
+                        "content_text":   clean,
+                        "item_index":     idx,
+                        "is_master":      0,
+                        "is_latest":      1,
+                        "parent_item_id": old_ids[idx] if idx < len(old_ids) else None,
+                    })
+                    docs.append(clean)
+                    metas.append({
+                        **base_meta,
+                        "section_type": sec_name,
+                        "sql_table":    "resume_section_items",
+                        "sql_id":       new_bid,
+                        "item_name":    "",
+                        "role_title":   "",
+                    })
+                    chroma_ids.append(f"sec_item_{new_bid}")
+                try:
+                    col_resume.upsert(documents=docs, metadatas=metas, ids=chroma_ids)
+                except Exception as exc:
+                    log.warning("[writeback] chroma flat_items re-embed failed %s: %s", sec_name, exc)
+        else:
+            # Plain flat blob: upsert the whole section as one document
+            try:
+                col_resume.upsert(
+                    documents=[new_content],
+                    metadatas=[{**base_meta, "section_type": sec_name}],
+                    ids=[f"res{resume_id}_{sec_name}"],
+                )
+            except Exception as exc:
+                log.warning("[writeback] chroma flat sync failed %s: %s", sec_name, exc)
+
         written += 1
 
     # ── Atomic sections: versioned insert ────────────────────────────────────

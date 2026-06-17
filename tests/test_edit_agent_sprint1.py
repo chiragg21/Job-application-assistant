@@ -115,19 +115,22 @@ class TestGlobalInstructionInPrompt:
         agent.global_instruction = "Always emphasise quantified achievements"
         self._setup_agent_current_state(agent)
 
-        result_mock = self._fake_llm_result()
-        agent.llmhandler.generate.return_value = result_mock
+        from app.models.edit import OneLlmOutput
+        fake_output = OneLlmOutput(lines_to_change=[], suggested_changes=[])
+        fake_result = MagicMock(schema_matched=True, parsed=fake_output)
 
-        with patch("app.agents.edit_agent.suggestions_cache") as mock_cache, \
+        with patch("app.agents.edit_agent.generate_for_task") as mock_gtf, \
+             patch("app.agents.edit_agent.suggestions_cache") as mock_cache, \
              patch("app.agents.edit_agent.FLAT_SECTIONS", self._REAL_FLAT), \
              patch("app.agents.edit_agent.ATOMIC_SECTIONS", self._REAL_ATOMIC):
             mock_cache.get.return_value = None
             mock_cache.make_key.return_value = "test-key"
+            mock_gtf.return_value = fake_result
             agent._resume_suggestions()
 
-        from app.utils.llm import Prompt
-        call_args = agent.llmhandler.generate.call_args
-        prompt_obj: Prompt = call_args[0][0]
+        # generate_for_task("editing", Prompt(...), OneLlmOutput) — Prompt is arg[1]
+        call_args = mock_gtf.call_args
+        prompt_obj = call_args[0][1]
         assert "Always emphasise quantified achievements" in prompt_obj.system
 
     def test_empty_global_instruction_does_not_add_section(self):
@@ -135,19 +138,21 @@ class TestGlobalInstructionInPrompt:
         agent.global_instruction = ""
         self._setup_agent_current_state(agent)
 
-        result_mock = self._fake_llm_result()
-        agent.llmhandler.generate.return_value = result_mock
+        from app.models.edit import OneLlmOutput
+        fake_output = OneLlmOutput(lines_to_change=[], suggested_changes=[])
+        fake_result = MagicMock(schema_matched=True, parsed=fake_output)
 
-        with patch("app.agents.edit_agent.suggestions_cache") as mock_cache, \
+        with patch("app.agents.edit_agent.generate_for_task") as mock_gtf, \
+             patch("app.agents.edit_agent.suggestions_cache") as mock_cache, \
              patch("app.agents.edit_agent.FLAT_SECTIONS", self._REAL_FLAT), \
              patch("app.agents.edit_agent.ATOMIC_SECTIONS", self._REAL_ATOMIC):
             mock_cache.get.return_value = None
             mock_cache.make_key.return_value = "test-key"
+            mock_gtf.return_value = fake_result
             agent._resume_suggestions()
 
-        call_args = agent.llmhandler.generate.call_args
-        from app.utils.llm import Prompt
-        prompt_obj: Prompt = call_args[0][0]
+        call_args = mock_gtf.call_args
+        prompt_obj = call_args[0][1]
         # "SPECIAL INSTRUCTION" section should NOT appear when instruction is empty
         assert "SPECIAL INSTRUCTION" not in prompt_obj.system
 
@@ -239,7 +244,7 @@ class TestNodeGenerateSuggestions:
             node_generate_suggestions(state)
 
         mock_pl.generate_suggestions_with_score_feedback.assert_called_once_with(
-            mock_agent, "Score low on experience section"
+            mock_agent, "Score low on experience section", thread_id=None
         )
 
     def test_no_score_feedback_calls_plain_generate(self):
@@ -253,5 +258,5 @@ class TestNodeGenerateSuggestions:
              patch("app.graph.edit_graph._serialise_cycle", return_value={}):
             node_generate_suggestions(state)
 
-        mock_pl.generate_suggestions.assert_called_once_with(mock_agent)
+        mock_pl.generate_suggestions.assert_called_once_with(mock_agent, thread_id=None)
         mock_pl.generate_suggestions_with_score_feedback.assert_not_called()

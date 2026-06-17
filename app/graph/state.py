@@ -38,10 +38,15 @@ class EditGraphState(TypedDict, total=False):
 
     # ------------------------------------------------------------------ #
     # Human-in-the-loop 1 — item selection                                #
-    # After interrupt the client sends back selected_items.               #
+    # After interrupt the client sends back selected_items + optional     #
+    # bullet_filter to pre-filter individual bullets before the LLM runs. #
     # ------------------------------------------------------------------ #
     selected_items: list[dict]   # subset of ranked_items chosen by user
     dropped_items:  list[dict]   # items the user explicitly dropped at any stage
+    # bullet_filter: {section_name → [keep_indices]} for flat sections;
+    #                {"section__item_name" → [keep_indices]} for atomic items.
+    # Missing key = keep all bullets in that section/item.
+    bullet_filter:  dict | None  # set by item_selection interrupt response
 
     # ------------------------------------------------------------------ #
     # Stage 4 — Edit agent                                                #
@@ -78,10 +83,19 @@ class EditGraphState(TypedDict, total=False):
     custom_instruction: str | None   # applied to all LLM edit calls this session
 
     # ------------------------------------------------------------------ #
+    # Quick resume mode                                                    #
+    # Set in item_selection response to skip the full editing cycle and    #
+    # jump straight to scoring (assembly of selected items with no LLM).  #
+    # ------------------------------------------------------------------ #
+    quick_resume: bool | None
+
+    # ------------------------------------------------------------------ #
     # Control / diagnostics                                                #
     # ------------------------------------------------------------------ #
-    stage:  str           # human-readable current stage label
-    error:  str | None    # last error message if a node failed
+    stage:     str           # human-readable current stage label
+    error:     str | None    # last error message if a node failed
+    thread_id: str | None    # LangGraph thread id — stored here so nodes
+                              # can push SSE events via app.core.stream
 
 
 class GenerationGraphState(TypedDict, total=False):

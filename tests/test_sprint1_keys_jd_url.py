@@ -41,6 +41,12 @@ def keys_client(tmp_path):
     mock_client_a.set_quota = MagicMock()
     mock_client_a.status = MagicMock(return_value=[])
 
+    # Set up key state so toggle_key can find "abc12345" in "gemini"
+    mock_key_state = MagicMock()
+    mock_key_state.key_id = "abc12345"
+    mock_key_state.model_states = {}
+    mock_client_a._km._states = {"gemini": [mock_key_state]}
+
     mock_status = [
         {
             "provider": "gemini",
@@ -202,7 +208,7 @@ class TestToggleKey:
     def test_toggle_calls_llm_client(self, keys_client):
         client, _, mock_client = keys_client
         client.patch("/keys/gemini/abc12345/toggle?active=false")
-        mock_client.toggle_key.assert_called()
+        mock_client._km._persist.assert_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -297,27 +303,26 @@ class TestJDExtractor:
     def test_returns_string(self):
         from app.core.jd_extractor import extract_jd_from_url
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
         mock_response.text = "We are looking for a Python engineer with 3+ years..."
-        with patch("requests.get", return_value=mock_response):
+        with patch("httpx.get", return_value=mock_response):
             result = extract_jd_from_url("https://example.com/job")
         assert isinstance(result, str)
 
     def test_raises_value_error_on_http_failure(self):
         from app.core.jd_extractor import extract_jd_from_url
         mock_response = MagicMock()
-        mock_response.status_code = 404
         mock_response.raise_for_status.side_effect = Exception("404 not found")
-        with patch("requests.get", return_value=mock_response):
+        with patch("httpx.get", return_value=mock_response):
             with pytest.raises((ValueError, Exception)):
                 extract_jd_from_url("https://example.com/gone")
 
     def test_content_returned_from_jina_response(self):
         from app.core.jd_extractor import extract_jd_from_url
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
         mock_response.text = "Job title: ML Engineer\nSkills: Python, PyTorch"
-        with patch("requests.get", return_value=mock_response):
+        with patch("httpx.get", return_value=mock_response):
             result = extract_jd_from_url("https://linkedin.com/jobs/123")
         assert "ML Engineer" in result or len(result) > 0
 
@@ -325,14 +330,14 @@ class TestJDExtractor:
         from app.core.jd_extractor import extract_jd_from_url
         captured = {}
         mock_response = MagicMock()
-        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
         mock_response.text = "Content"
 
         def _capture(url, **kwargs):
             captured["url"] = url
             return mock_response
 
-        with patch("requests.get", side_effect=_capture):
+        with patch("httpx.get", side_effect=_capture):
             extract_jd_from_url("https://example.com/job")
 
         called_url = captured.get("url", "")
